@@ -584,6 +584,31 @@ fn core_target_triage(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
                 toolsets = vec!["core", "formats"];
                 tools = vec![("game_archives_list", "find the archives it packs its files in"), ("game_pak_list", "list what's in an Unreal pak")];
             }
+            let mut disc_facts = None;
+            match t.kind {
+                TargetKind::DiscImage => {
+                    let (p, f) = super::game_disc_tools::triage_disc(&t.name, &t.bytes);
+                    plain = p;
+                    disc_facts = Some(("disc", f));
+                    toolsets = vec!["core", "formats"];
+                    tools = vec![
+                        ("game_disc_files_list", "list the files on the disc"),
+                        ("game_disc_files_extract", "take the files out into a folder"),
+                        ("firmware_regions_list", "look for other filesystems or programs on the disc"),
+                    ];
+                }
+                TargetKind::CueSheet => {
+                    let (p, f) = super::game_disc_tools::triage_cue(&t.name, &t.path, &t.bytes);
+                    plain = p;
+                    disc_facts = Some(("cue", f));
+                    toolsets = vec!["core", "formats"];
+                    tools = vec![
+                        ("game_disc_files_list", "list the files on the disc this sheet describes (pass this sheet's path)"),
+                        ("game_disc_files_extract", "take the files out into a folder"),
+                    ];
+                }
+                _ => {}
+            }
             let mut result = json!({
                 "plain_english": plain,
                 "kind": t.kind,
@@ -594,6 +619,9 @@ fn core_target_triage(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
             });
             if let Some((g, _)) = game {
                 result["game"] = json!(g);
+            }
+            if let Some((key, facts)) = disc_facts {
+                result[key] = facts;
             }
             builder
                 .result(result)
@@ -785,6 +813,36 @@ mod tests {
     use craft_anything_testkit as tk;
     use serde_json::json;
 
+    #[test]
+    fn triage_recognises_a_disc_image_and_a_cue_sheet() {
+        use tk::disc::{Node, Wrap, iso_image};
+        let tree = vec![Node::File("a.txt", b"x".to_vec()), Node::Dir("PSP_GAME", vec![Node::File("param.sfo", vec![1u8; 100])])];
+        for (name, wrap) in [("game.iso", Wrap::Cooked), ("track.bin", Wrap::RawMode1), ("gd.bin", Wrap::GdRom)] {
+            let img = iso_image(&tree, wrap, "PSP GAME", "MY DISC", false);
+            let e = engine_with(name, &img);
+            let r = call(&e, "core_target_triage", json!({}));
+            assert_eq!(r["result"]["kind"], "disc-image", "{name}");
+            let plain = r["result"]["plain_english"].as_str().unwrap();
+            assert!(
+                plain.contains("game disc image") && plain.contains("\"MY DISC\"") && plain.contains("\"PSP GAME\"") && plain.contains("2 files"),
+                "{plain}"
+            );
+            assert_eq!(r["result"]["disc"]["files"], 2);
+            assert!(r["result"]["next_steps"].as_array().unwrap().iter().any(|s| s["tool"] == "game_disc_files_extract"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("g (Track 1).bin"), vec![0u8; 4704]).unwrap();
+        let cue = "REM SINGLE-DENSITY AREA\nFILE \"g (Track 1).bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\nFILE \"g (Track 2).bin\" BINARY\n  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n";
+        let sheet = dir.path().join("g.cue");
+        std::fs::write(&sheet, cue).unwrap();
+        let e = engine_with("g.cue", cue.as_bytes());
+        let r = call(&e, "core_target_triage", json!({"path": sheet.to_string_lossy()}));
+        assert_eq!(r["result"]["kind"], "cue-sheet");
+        let tracks = r["result"]["cue"]["tracks"].as_array().unwrap();
+        assert_eq!((tracks.len(), tracks[0]["found"].clone(), tracks[1]["found"].clone()), (2, json!(true), json!(false)));
+        assert_eq!(tracks[0]["mode"], "MODE1/2352");
+        assert!(r["result"]["plain_english"].as_str().unwrap().contains("1 track file(s) weren't found"));
+    }
     #[test]
     fn triage_explains_an_unreadable_elf_header() {
         let mut header = vec![0u8; 64];

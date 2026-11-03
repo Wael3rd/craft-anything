@@ -177,6 +177,8 @@ mod tests {
             "js_app_map",
             "web_page_show",
             "game_archives_list",
+            "game_disc_files_list",
+            "game_disc_files_extract",
         ] {
             assert!(!allows(id), "{id} reads the original");
             assert!(availability(id, true).is_some_and(|a| !a.available));

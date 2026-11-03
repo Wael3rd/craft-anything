@@ -496,3 +496,11 @@ naming a tool.
 branch; `git stash` keeps only tracked files, so a new file stayed in the tree and `git add -A`
 put it into the other PR. Use `git stash -u` (or commit the work in progress on its own branch),
 and read `git status` before `git add -A`.
+
+**A cooked guess that matched a raw disc.** The firmware scan looked for an ISO 9660 volume as
+`CD001` at +0x8001; a raw 2352-byte track holds the same bytes 16 bytes into sector 16, so the cooked
+check "found" a volume 4,880 bytes into the file and the real one was never reported. When two
+layouts can both match the same bytes, test the one with the stronger signature first (the raw
+sector's sync pattern) and only then the weaker, and test each layout wrapped behind some leading
+bytes. Disc images also can be 1 GB+: tools read them through a file handle (`iso9660::Source`),
+not into memory.

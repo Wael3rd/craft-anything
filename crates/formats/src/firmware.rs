@@ -400,7 +400,7 @@ impl<'a> Scanner<'a> {
         match self.r.u8(i)? {
             b'u' if self.at(i, b"ustar") => self.tar(i.checked_sub(257)?),
             0x53 if self.at(i, &[0x53, 0xef]) => self.ext(i.checked_sub(0x438)?),
-            b'C' if self.at(i, b"CD001") => self.iso(i.checked_sub(0x8001)?),
+            b'C' if self.at(i, b"CD001") => self.iso_at(i),
             _ => None,
         }
     }
@@ -1157,8 +1157,25 @@ impl<'a> Scanner<'a> {
         ))
     }
 
-    fn iso(&mut self, start: usize) -> Option<Region> {
-        let pvd = start.checked_add(0x8000)?;
+    /// An ISO 9660 volume whose `CD001` sits at `i`: cooked (descriptor at +0x8000), or raw 2352-byte
+    /// sectors (sync pattern, then a Mode 1 or Mode 2 Form 1 header, the descriptor 16 or 24 bytes in).
+    fn iso_at(&mut self, i: usize) -> Option<Region> {
+        // Raw first: its descriptor also looks like a cooked one that starts 16 bytes later.
+        let raw = i.checked_sub(1 + 16).filter(|s| self.raw_sector(*s, 1)).or_else(|| i.checked_sub(1 + 24).filter(|s| self.raw_sector(*s, 2)));
+        if let Some(sector_start) = raw {
+            let data_off = i.checked_sub(sector_start)?.checked_sub(1)?;
+            return self.iso(sector_start.checked_sub(16 * 2352)?, 2352, data_off);
+        }
+        self.iso(i.checked_sub(0x8001)?, 2048, 0)
+    }
+
+    /// A raw CD sector at `s`: the 12-byte sync pattern and the given mode byte.
+    fn raw_sector(&self, s: usize, mode: u8) -> bool {
+        self.at(s, &[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]) && self.r.u8(s + 15) == Some(mode)
+    }
+
+    fn iso(&mut self, start: usize, sector: usize, data_off: usize) -> Option<Region> {
+        let pvd = start.checked_add(16usize.checked_mul(sector)?)?.checked_add(data_off)?;
         if self.r.u8(pvd)? != 1 || self.r.u8(pvd + 6)? != 1 || !self.probe("iso9660") {
             return None;
         }
@@ -1168,7 +1185,8 @@ impl<'a> Scanner<'a> {
             return None;
         }
         let vol = cstr_field(self.r.slice(pvd + 40, 32));
-        let (len, cut) = clamp(u64::from(blocks) * u64::from(bsize), start, self.data.len());
+        let unit = if sector == 2048 { u64::from(bsize) } else { sector as u64 };
+        let (len, cut) = clamp(u64::from(blocks).saturating_mul(unit), start, self.data.len());
         Some(reg(
             start,
             Some(len),
@@ -1176,8 +1194,8 @@ impl<'a> Scanner<'a> {
             Family::Filesystem,
             format!("ISO 9660 volume {vol:?}"),
             "high",
-            Unpack::Carve,
-            json!({"volume_id": vol, "block_size": bsize, "blocks": blocks, "truncated": cut}),
+            if bsize == 2048 { Unpack::Filesystem } else { Unpack::Carve },
+            json!({"volume_id": vol, "block_size": bsize, "blocks": blocks, "sector_size": sector, "truncated": cut}),
         ))
     }
 
@@ -1706,6 +1724,24 @@ mod tests {
         bad[n - 1] ^= 1;
         assert!(inflate(&bad, true, 1 << 20, false).is_err());
         assert_eq!(gzip_header(&gz).unwrap().original_name.as_deref(), Some("x.bin"));
+    }
+
+    #[test]
+    fn finds_cooked_and_raw_disc_images() {
+        use craft_anything_testkit::disc::{Node, Wrap, iso_image};
+        let tree = vec![Node::File("a.bin", vec![1u8; 3000])];
+        for (wrap, sector) in [(Wrap::Cooked, 2048u64), (Wrap::RawMode1, 2352), (Wrap::RawMode2Form1, 2352), (Wrap::GdRom, 2352)] {
+            let img = iso_image(&tree, wrap, "TEST", "DISC", false);
+            // Some bytes in front, so the volume does not start at 0.
+            let mut data = vec![0x5au8; 100];
+            data.extend_from_slice(&img);
+            let r = scan(&data, &ScanOptions::default(), &no_stop);
+            let iso = r.regions.iter().find(|x| x.kind == "iso9660").expect("iso9660 region");
+            assert_eq!(iso.offset, 100, "sector {sector}: {:?}", r.regions.iter().map(|x| (x.kind, x.offset)).collect::<Vec<_>>());
+            assert_eq!(iso.unpack, Unpack::Filesystem);
+            assert_eq!(iso.details["sector_size"], sector);
+            assert_eq!(iso.details["volume_id"], "DISC");
+        }
     }
 
     #[test]

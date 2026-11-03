@@ -42,6 +42,10 @@ pub enum TargetKind {
     Sqlite,
     /// A DOS .COM program.
     DosCom,
+    /// A game disc image (ISO 9660, cooked or raw sectors).
+    DiscImage,
+    /// A CUE sheet naming a disc's track files.
+    CueSheet,
     /// Raw bytes with a user-declared architecture (firmware, shellcode).
     RawBinary,
     Unknown,
@@ -69,6 +73,8 @@ impl TargetKind {
             TargetKind::Evm => "A smart contract (EVM bytecode)",
             TargetKind::Sqlite => "A SQLite database (how an app stores its data)",
             TargetKind::DosCom => "A DOS program",
+            TargetKind::DiscImage => "A game disc image",
+            TargetKind::CueSheet => "A disc sheet (CUE) that lists a disc's track files",
             TargetKind::RawBinary => "Raw machine code",
             TargetKind::Unknown => "A file we don't recognise yet",
         }
@@ -110,6 +116,13 @@ pub fn sniff(bytes: &[u8], name: &str) -> TargetKind {
         } else {
             TargetKind::Zip
         }
+    } else if craft_anything_formats::fsread::iso9660::detect(bytes).is_some() {
+        TargetKind::DiscImage
+    } else if lower.ends_with(".cue")
+        && bytes.len() <= craft_anything_formats::cue::MAX_BYTES
+        && craft_anything_formats::cue::looks_like_cue(&String::from_utf8_lossy(bytes))
+    {
+        TargetKind::CueSheet
     } else if lower.ends_with(".asar") || craft_anything_formats::looks_like_asar(bytes) {
         TargetKind::Asar
     } else if starts(b"bplist00") || (lower.ends_with(".plist") && bytes.windows(6).take(512).any(|w| w == b"<plist")) {
@@ -210,5 +223,26 @@ mod tests {
         assert_eq!(sniff(b"SQLite format 3\0\x10\x00", "app.db"), TargetKind::Sqlite);
         assert_eq!(sniff(b"", "x"), TargetKind::Unknown);
         assert_eq!(sniff(b"console.log(1)", "main.js"), TargetKind::Script);
+        assert_eq!(
+            sniff(
+                b"FILE \"a.bin\" BINARY
+ TRACK 01 MODE1/2352
+",
+                "a.cue"
+            ),
+            TargetKind::CueSheet
+        );
+        assert_eq!(
+            sniff(
+                b"FILE \"a.bin\" BINARY
+ TRACK 01 MODE1/2352
+",
+                "a.txt"
+            ),
+            TargetKind::Unknown
+        );
+        let disc = craft_anything_testkit::disc::iso_image(&[], craft_anything_testkit::disc::Wrap::Cooked, "S", "V", false);
+        assert_eq!(sniff(&disc, "x.iso"), TargetKind::DiscImage);
+        assert_eq!(sniff(&disc[..20_000], "x.iso"), TargetKind::Unknown, "no descriptor at sector 16");
     }
 }

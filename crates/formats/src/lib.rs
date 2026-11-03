@@ -15,6 +15,7 @@ pub mod bytes;
 pub mod car;
 pub mod codesign;
 mod common;
+pub mod cue;
 pub mod dart;
 pub mod decompress;
 pub mod der;

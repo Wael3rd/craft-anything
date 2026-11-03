@@ -487,9 +487,21 @@ Owner: open · Status: in progress
       decoder can't read (a MIPS PSP module), though finding strings needs no decoding
 - [ ] Triage says a PSP module (`.prx`, MIPS ELF of type 0xFFA0) is "a program for Linux, built for
       other"; its imports by library (`.sceStub.text.*`) aren't read as imports
-- [ ] Disc images: triage doesn't recognise an ISO 9660 image, a `.cue` or its `.bin` tracks
-      (`core_archive_show` calls a PSP ISO "text"); `firmware_regions_list` finds the ISO 9660, but
-      nothing extracts its files
+- [x] Disc images: triage recognises an ISO 9660 image (cooked 2048-byte, raw Mode 1 / Mode 2 Form 1
+      sectors, Dreamcast GD-ROM high-density track) and a `.cue` sheet (tracks, modes, indexes, files
+      found beside it); `game_disc_files_list` and `game_disc_files_extract` read the files through a
+      file handle (never the whole image in memory), with folder prefix, paging and a
+      SHA-256 per file; `firmware_image_extract` unpacks an ISO 9660 region too (`firmware_regions_list`
+      finds raw-sector volumes); `core_archive_show`/`core_archive_extract` now say a disc isn't an
+      archive and point at the disc tools. Checked live on a PSP ISO (1529 files) and a Dreamcast cue
+      (1ST_READ.BIN SHA-256 matches)
+- [ ] Disc images: Rock Ridge names, multi-extent files and Mode 2 Form 2 (2324-byte) sectors aren't read;
+      PS1/PS2 `.bin`/`.cue` discs and UDF-only discs weren't tried; `.cue` tracks in other sector sizes
+      (2336) aren't detected
+- [ ] Disc images: `core_target_open` still reads a whole image into memory (2 GiB cap), so triage of a
+      larger `.bin` is refused; open it by path with the disc tools instead (they stream)
+- [ ] Disc images: the Joliet (UCS-2) name path has no test (no synthetic or real Joliet disc was tried)
+- [ ] Disc images: `.chd`, `.cdi`, `.gdi`, `.nrg`, `.mdf` and compressed discs aren't recognised
 - [ ] The managed Java doesn't start from a deep folder (its `jvm.dll` path past ~250 characters):
       Ghidra's launcher then blames `JAVA_HOME`, and our error points at an analysis log that was
       never written

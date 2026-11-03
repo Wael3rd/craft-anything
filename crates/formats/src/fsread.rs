@@ -1,5 +1,5 @@
 //! Read-only readers for the filesystems a firmware image commonly carries: romfs, cramfs,
-//! SquashFS (v4, the common gzip/xz/zstd/lzma cases), ext2/3/4 (a minimal reader), and a
+//! SquashFS (v4, the common gzip/xz/zstd/lzma cases), ext2/3/4 (a minimal reader), ISO 9660 disc images, and a
 //! best-effort JFFS2 node scan. Each reader lists entries and, for regular files, recovers their
 //! bytes. Everything is strictly bounded (entries, recursion depth, per-file and total bytes) and
 //! never panics or loops forever on a corrupt or cyclic image.
@@ -11,6 +11,7 @@ use serde::Serialize;
 
 pub mod cramfs;
 pub mod extfs;
+pub mod iso9660;
 pub mod jffs2;
 pub mod romfs;
 pub mod squashfs;
@@ -106,6 +107,7 @@ pub fn read(kind: &str, data: &[u8], limits: &Limits) -> Option<FsImage> {
         "romfs" => Some(romfs::read(data, limits)),
         "ext2" | "ext3" | "ext4" => Some(extfs::read(data, limits)),
         "jffs2" => Some(jffs2::read(data, limits)),
+        "iso9660" => Some(iso9660::read(data, limits)),
         _ => None,
     }
 }

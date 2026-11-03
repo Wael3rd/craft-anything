@@ -537,6 +537,11 @@ fn same_limits(a: &InvLimits, b: &InvLimits) -> bool {
 fn core_archive_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: InspectArtifactParams = parse_params(params)?;
     let path = target_path(ctx, p.path.as_deref())?;
+    if !path.is_dir()
+        && let Some(err) = super::game_disc_tools::not_an_archive(&path)
+    {
+        return Err(err);
+    }
     let limits = show_limits(p.max_depth, p.max_entries, p.max_total_bytes);
     ctx.report(None, format!("Inventorying {}", path.display()));
     let (inv, subject, unlisted) = inventory_path_unlisted(&path, limits, &ctx.cancel)?;
@@ -621,6 +626,9 @@ fn core_archive_extract(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
         return Err(
             ToolError::unsupported(format!("{} is already a folder", path.display())).with_remediation("Folders don't need extracting; analyse them directly.")
         );
+    }
+    if let Some(err) = super::game_disc_tools::not_an_archive(&path) {
+        return Err(err);
     }
     let bytes = read_capped(&path, crate::target::MAX_TARGET_BYTES)?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();

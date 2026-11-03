@@ -14,6 +14,7 @@
 pub mod android;
 pub mod apple;
 pub mod crypto;
+pub mod disc;
 pub mod electron;
 pub mod firmware;
 pub mod flutter;
