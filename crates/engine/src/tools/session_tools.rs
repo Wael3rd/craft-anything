@@ -201,7 +201,10 @@ fn core_target_open(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Tool
             // language that says how (for this target, or in Settings).
             let pinned = p.language_id.as_deref().is_some_and(|l| !l.trim().is_empty())
                 || ctx.session.settings.engines.ghidra.language_id.as_deref().is_some_and(|l| !l.trim().is_empty());
-            if craft_anything_formats::Arch::from_name(&architecture).is_none() && !pinned {
+            // A processor we can name (mips) isn't one the built-in engine decodes.
+            let decoded = craft_anything_formats::Arch::from_name(&architecture)
+                .is_some_and(|a| craft_anything_disasm::image::mode_for(&craft_anything_formats::Binary::raw(a, 0, 0, 0)).is_some());
+            if !decoded && !pinned {
                 return Err(ToolError::invalid(format!("unsupported architecture {architecture}")).with_remediation(
                     "The built-in engine reads x86, x86_64, arm and arm64. For another processor, also pass language_id with the Ghidra language for it (e.g. SuperH4:LE:32:default, MIPS:LE:32:default) and use Deep mode with Ghidra installed.",
                 ));

@@ -357,6 +357,10 @@ mod tests {
         let err = call_err(&e, "core_target_open", open.clone());
         assert!(err.message.contains("sh4"), "{err:?}");
         assert!(err.remediation.as_deref().unwrap_or_default().contains("language_id"), "{err:?}");
+        // A processor with a name of its own here (mips) is no more readable without one.
+        let mut mips = open.clone();
+        mips["architecture"] = json!("mips");
+        assert!(call_err(&e, "core_target_open", mips).message.contains("mips"));
         let mut pinned = open;
         pinned["language_id"] = json!("SuperH4:LE:32:default");
         call(&e, "core_target_open", pinned);

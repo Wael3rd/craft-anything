@@ -19,6 +19,9 @@ pub const ET_PRX: u16 = 0xFFA0;
 const MODULE_INFO_LEN: usize = 52;
 /// Most library entries read from either table.
 const MAX_LIBRARIES: usize = 1024;
+/// The most NIDs read from one module's import (or export) tables in all: every library may point
+/// at the same table, so a cap per library alone lets a small file ask for gigabytes.
+const MAX_NIDS: usize = MAX_IMPORTS;
 /// Most characters kept of a library or module name.
 const MAX_NAME: usize = 64;
 /// Bytes in one function stub (a jump and its delay slot).
@@ -229,6 +232,7 @@ fn read_stubs(data: &[u8], b: &mut Binary, range: Option<(u64, u64)>) -> Vec<Imp
     let mut out = Vec::new();
     let Some((top, end)) = range else { return out };
     let mut pos = top;
+    let mut nids_left = MAX_NIDS;
     while pos < end && out.len() < MAX_LIBRARIES {
         let (Some(name_ptr), Some(version), Some(flags), Some(size_vars), Some(func_count)) =
             (u32_at(b, data, pos), u16_at(b, data, pos + 4), u16_at(b, data, pos + 6), u16_at(b, data, pos + 8), u16_at(b, data, pos + 10))
@@ -255,7 +259,12 @@ fn read_stubs(data: &[u8], b: &mut Binary, range: Option<(u64, u64)>) -> Vec<Imp
             }
         };
         let mut lib = ImportLib { name, version, flags, functions: Vec::new(), variables: Vec::new() };
-        let total = usize::from(func_count).saturating_add(var_count);
+        let listed = usize::from(func_count).saturating_add(var_count);
+        let total = listed.min(nids_left);
+        nids_left -= total;
+        if total < listed {
+            b.warnings.push(format!("PSP imports: stopped at {MAX_NIDS} NIDs in all"));
+        }
         let mut nids = Vec::new();
         for i in 0..total {
             let Some(nid) = u64::from(nid_ptr).checked_add(4 * i as u64).and_then(|a| u32_at(b, data, a)) else {
@@ -296,6 +305,7 @@ fn read_entries(data: &[u8], b: &mut Binary, range: Option<(u64, u64)>) -> Vec<E
     let mut out = Vec::new();
     let Some((top, end)) = range else { return out };
     let mut pos = top;
+    let mut nids_left = MAX_NIDS;
     while pos < end && out.len() < MAX_LIBRARIES {
         let (Some(name_ptr), Some(version), Some(attributes), Some(size_vars), Some(func_count), Some(table)) = (
             u32_at(b, data, pos),
@@ -316,11 +326,16 @@ fn read_entries(data: &[u8], b: &mut Binary, range: Option<(u64, u64)>) -> Vec<E
         }
         let name = if name_ptr == 0 { None } else { str_at(b, data, u64::from(name_ptr)).filter(|n| !n.is_empty()) };
         let mut lib = ExportLib { name, version, attributes, functions: Vec::new(), variables: Vec::new() };
-        let total = usize::from(func_count).saturating_add(var_count);
-        // The NIDs come first, then one address per NID.
+        let listed = usize::from(func_count).saturating_add(var_count);
+        let total = listed.min(nids_left);
+        nids_left -= total;
+        if total < listed {
+            b.warnings.push(format!("PSP exports: stopped at {MAX_NIDS} NIDs in all"));
+        }
+        // The NIDs come first, then one address per NID (the table's own count places them).
         for i in 0..total {
             let nid_va = u64::from(table).checked_add(4 * i as u64);
-            let addr_va = u64::from(table).checked_add(4 * (total as u64 + i as u64));
+            let addr_va = u64::from(table).checked_add(4 * (listed as u64 + i as u64));
             let (Some(nid), Some(addr)) = (nid_va.and_then(|a| u32_at(b, data, a)), addr_va.and_then(|a| u32_at(b, data, a))) else {
                 b.warnings.push(format!("PSP exports: {} lists {total} entries but only {i} are in the file", lib.name.as_deref().unwrap_or("(system)")));
                 break;
@@ -448,6 +463,28 @@ mod module_tests {
         }
         assert!(parse(Fault::BadStubPointer).imports.iter().all(|i| i.slot.is_none()));
         assert_eq!(parse(Fault::NoModuleInfo).libraries.len(), 1);
+    }
+
+    #[test]
+    fn libraries_sharing_one_huge_nid_table_cost_a_bounded_amount() {
+        // 1024 import entries, each claiming 65535 functions from the same 256 KB NID table: read
+        // in full that would be 67 million NIDs from a file of a quarter of a megabyte.
+        const ENTRIES: u64 = 1024;
+        let table = ENTRIES * 20;
+        let mut data = vec![0u8; usize::try_from(table + 4 * 65_535 + 16).unwrap()];
+        for i in 0..ENTRIES {
+            let at = usize::try_from(i * 20).unwrap();
+            data[at + 8] = 5; // 5 words long, no variables
+            data[at + 10..at + 12].copy_from_slice(&u16::MAX.to_le_bytes());
+            data[at + 12..at + 16].copy_from_slice(&u32::try_from(table).unwrap().to_le_bytes());
+        }
+        let mut b = Binary::raw(Arch::Mips, 0, data.len() as u64, 0);
+        let started = std::time::Instant::now();
+        let libs = read_stubs(&data, &mut b, Some((0, table)));
+        let read: usize = libs.iter().map(|l| l.functions.len() + l.variables.len()).sum();
+        assert!(read <= MAX_NIDS, "{read}");
+        assert!(b.warnings.iter().any(|w| w.contains("NIDs in all")), "{:?}", b.warnings.first());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
