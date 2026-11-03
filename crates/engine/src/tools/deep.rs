@@ -222,6 +222,80 @@ pub fn decompile(ctx: &mut Ctx<'_>, at: At, our_base: u64) -> Result<Result<Deco
     }
 }
 
+/// Every function the deep engine's analysis found, with what moves its addresses to ours.
+pub struct Listed {
+    pub provider: Arc<dyn DeepDecompiler>,
+    /// At the engine's addresses; [`Listed::rebase`] moves them.
+    pub functions: Vec<DeepFunction>,
+    pub rebase: ghidra::Rebase,
+}
+
+impl Listed {
+    /// The function Ghidra named exactly `name` (`FUN_8c02d2a8`, `entry`, a symbol it read).
+    pub fn named(&self, name: &str) -> Option<&DeepFunction> {
+        let name = name.trim();
+        self.functions.iter().find(|f| f.name == name)
+    }
+
+    /// Evidence for `operation` answered from this list: the engine is recorded as Ghidra.
+    pub fn evidence(&self, ctx: &Ctx<'_>, operation: &str, params: serde_json::Value) -> Result<EvidenceBuilder, ToolError> {
+        let subject = ctx.session.active()?.target.subject();
+        let mut b = EvidenceBuilder::new(operation, subject, environment(&*self.provider))
+            .params(params)
+            .confidence(Confidence::Derived)
+            .target_content(true)
+            .limitation(Limitation::new(
+                "deep_engine",
+                "the functions come from the external Deep engine's analysis (Ghidra): the built-in engine can't decode this processor",
+            ));
+        if !self.rebase.is_identity() {
+            b = b.limitation(Limitation::new(
+                "engine_rebased",
+                format!(
+                    "Ghidra loaded this program at {:#x}, not where the built-in engine reads it ({:#x}); addresses are the built-in ones, and those in Ghidra's names (FUN_…) are Ghidra's",
+                    self.rebase.theirs(),
+                    self.rebase.ours()
+                ),
+            ));
+        }
+        Ok(b)
+    }
+}
+
+/// Ask the deep engine for every function its analysis found (`our_base` as in [`decompile`]).
+/// `Err(why)` when it can't answer (`None` in Clean room); `Ok(Err(..))` only for a cancellation.
+pub fn functions(ctx: &mut Ctx<'_>, our_base: u64) -> Result<Result<Listed, ToolError>, Option<String>> {
+    let provider = provider_for_active(ctx)?;
+    let rebase = ghidra::Rebase::new(our_base, provider.image_base());
+    match provider.list_functions() {
+        Ok(mut functions) => {
+            functions.sort_by_key(|f| f.entry);
+            Ok(Ok(Listed { provider, functions, rebase }))
+        }
+        Err(ghidra::GhidraError::Cancelled) => Ok(Err(ToolError::cancelled())),
+        Err(e) => {
+            log::warn!("Ghidra couldn't list its functions: {e}");
+            if matches!(e, ghidra::GhidraError::Connection(_) | ghidra::GhidraError::Protocol(_))
+                && let Ok(t) = ctx.session.active_mut()
+            {
+                t.ext.remove::<DeepSlot>();
+            }
+            Err(Some(format!("Ghidra couldn't list its functions ({e}).")))
+        }
+    }
+}
+
+/// Where a deep engine's answer came from, for the evidence.
+fn environment(provider: &dyn DeepDecompiler) -> Environment {
+    Environment {
+        clean_room: false,
+        engine: provider.engine().to_string(),
+        engine_version: provider.engine_version(),
+        host: host_triple(),
+        language_id: provider.language_id(),
+    }
+}
+
 fn build_evidence(
     ctx: &Ctx<'_>,
     provider: &dyn DeepDecompiler,
@@ -230,13 +304,7 @@ fn build_evidence(
     params: serde_json::Value,
 ) -> Result<ToolOutput, ToolError> {
     let subject = ctx.session.active()?.target.subject();
-    let env = Environment {
-        clean_room: false,
-        engine: provider.engine().to_string(),
-        engine_version: provider.engine_version(),
-        host: host_triple(),
-        language_id: provider.language_id(),
-    };
+    let env = environment(provider);
     let line_count = df.pseudocode.as_deref().map(|p| p.lines().count()).unwrap_or(0);
     // The entry as every other tool gives it; Ghidra's own only when it differs.
     let entry = rebase.from_engine(df.entry);
@@ -313,8 +381,10 @@ mod tests {
             let pseudocode = Some(format!("int FUN_{entry:08x}(void) {{ return 0; }}"));
             Ok(Some(DeepFunction { entry, name: format!("FUN_{entry:08x}"), signature: None, pseudocode, created: false }))
         }
+        /// Its analysis found the entry point and one function after it.
         fn list_functions(&self) -> Result<Vec<DeepFunction>, ghidra::GhidraError> {
-            Ok(Vec::new())
+            let f = |entry: u64, name: String| DeepFunction { entry, name, signature: None, pseudocode: None, created: false };
+            Ok(vec![f(self.base + 4, format!("FUN_{:08x}", self.base + 4)), f(self.base, "entry".into())])
         }
     }
 
@@ -374,16 +444,31 @@ mod tests {
         assert_eq!(r["result"]["entry"], "0x8c010000");
         assert!(r["result"].get("engine_entry").is_none(), "{r}");
 
-        // The batch tool asks Ghidra too, item by item; a name only the built-in engine could
-        // place fails on its own.
-        let r = call(&e, "native_functions_decompile", json!({"addresses": ["0x8c010000", "FUN_8c010004", "entry"]}));
-        assert_eq!(r["result"]["succeeded"], 2, "{r}");
-        assert_eq!(r["result"]["from_deep_engine"], 2, "{r}");
+        // The batch tool asks Ghidra too, item by item; a name is looked up in Ghidra's list, and
+        // one it doesn't have fails on its own.
+        let r = call(&e, "native_functions_decompile", json!({"addresses": ["0x8c010000", "FUN_8c010004", "entry", "main"]}));
+        assert_eq!(r["result"]["succeeded"], 3, "{r}");
+        assert_eq!(r["result"]["from_deep_engine"], 3, "{r}");
         assert_eq!(r["result"]["items"][1]["engine"], "ghidra");
         assert_eq!(r["result"]["items"][1]["entry"], "0x8c010004");
-        assert_eq!(r["result"]["items"][2]["ok"], false);
+        assert_eq!(r["result"]["items"][2]["entry"], "0x8c010000", "entry, by Ghidra's name for it");
+        assert_eq!(r["result"]["items"][3]["ok"], false);
         assert_eq!(r["confidence"], "derived", "{r}");
         assert!(r["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "deep_engine"), "{r}");
+        let err = call_err(&e, "native_function_pseudocode", json!({"function": "main"}));
+        assert!(err.message.contains("no function named main"), "{err:?}");
+
+        // Ghidra's list stands in for the built-in engine's: listed and searched by its names.
+        let r = call(&e, "native_functions_list", json!({}));
+        assert_eq!(r["environment"]["engine"], "ghidra", "{r}");
+        assert_eq!(r["result"]["total"], 2, "{r}");
+        assert_eq!(r["result"]["functions"][0]["address"], "0x8c010000", "in address order");
+        assert_eq!(r["result"]["functions"][0]["name"], "entry");
+        assert!(r["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "deep_engine"), "{r}");
+        call(&e, "native_name_set", json!({"address": "0x8c010004", "name": "boot"}));
+        let r = call(&e, "native_functions_search", json!({"pattern": "^(entry|boot)$", "mode": "regex"}));
+        assert_eq!(r["result"]["functions"], 2, "your names count too: {r}");
+        assert_eq!(r["confidence"], "derived");
 
         // Without Ghidra there's no answer: the built-in engine says it can't decode this
         // processor, and why Ghidra didn't answer.
@@ -395,6 +480,11 @@ mod tests {
         let r = call(&e, "native_functions_decompile", json!({"addresses": ["0x8c010000"]}));
         assert_eq!(r["result"]["succeeded"], 0, "{r}");
         assert!(r["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "deep_engine_unavailable"), "{r}");
+        for (tool, params) in [("native_functions_list", json!({})), ("native_functions_search", json!({"pattern": "entry"}))] {
+            let err = call_err(&e, tool, params);
+            assert_eq!(err.code, craft_anything_evidence::ErrorCode::NotSupported, "{tool}: {err:?}");
+            assert!(err.remediation.unwrap_or_default().contains("no other list"), "{tool}");
+        }
     }
 
     #[test]

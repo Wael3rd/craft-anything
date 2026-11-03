@@ -483,6 +483,10 @@ Owner: open · Status: in progress
       loaded into Ghidra where it runs (`-loader BinaryLoader -loader-baseAddr`, part of the cache key)
 - [x] `native_functions_decompile` asks Ghidra in Deep mode, item by item, as
       `native_function_pseudocode` does (it used the built-in lifter only)
+- [x] Deep mode lists and searches the functions of a program the built-in engine can't decode
+      from Ghidra's analysis (`native_functions_list`, `native_functions_search`, with the file's
+      imports), and a name Ghidra gave (`entry`, a symbol it read) finds the function to decompile;
+      the evidence records Ghidra as the engine
 - [ ] String tools (`native_strings_find`, `native_strings_browse`) refuse a program the built-in
       decoder can't read (a MIPS PSP module), though finding strings needs no decoding
 - [ ] Triage says a PSP module (`.prx`, MIPS ELF of type 0xFFA0) is "a program for Linux, built for

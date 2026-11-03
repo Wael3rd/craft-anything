@@ -17,7 +17,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "native_functions_list",
             "List functions",
-            "Every function the built-in engine found: entry, name, size, blocks, how it was found. Paged (offset/limit).",
+            "Every function the built-in engine found: entry, name, size, blocks, how it was found. In Deep mode, for a processor it can't decode, the functions Ghidra's analysis found (entry and name). Paged (offset/limit).",
             "See every function (piece of code) in the program.",
             Native,
             e,
@@ -83,7 +83,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "native_functions_search",
             "Search functions",
-            "Complete, deterministic search of function names (yours and the engine's) and imports (kind \"import\", e.g. CreateWindowExW). mode literal or regex; case-insensitive unless case_sensitive. Paged.",
+            "Complete, deterministic search of function names (yours and the engine's) and imports (kind \"import\", e.g. CreateWindowExW); in Deep mode, for a processor the built-in engine can't decode, Ghidra's function names. mode literal or regex; case-insensitive unless case_sensitive. Paged.",
             "Find functions by name.",
             Native,
             e,
@@ -338,10 +338,54 @@ impl Matcher {
     }
 }
 
+/// Ghidra's functions for a program whose processor the built-in engine can't decode (Deep
+/// mode); `builtin` is the built-in engine's error, returned (saying why Ghidra didn't answer
+/// either) for anything else.
+pub(super) fn deep_listing(ctx: &mut Ctx<'_>, builtin: ToolError) -> Result<super::deep::Listed, ToolError> {
+    if builtin.code != ErrorCode::NotSupported || ctx.session.clean_room() {
+        return Err(builtin);
+    }
+    // Only a program we can place in memory but not decode; a file that isn't a program at all
+    // keeps the built-in error.
+    let Ok(img) = image(ctx) else { return Err(builtin) };
+    if img.0.mode.is_some() {
+        return Err(builtin);
+    }
+    let our_base = img.0.bin.image_base;
+    match super::deep::functions(ctx, our_base) {
+        Ok(listed) => listed,
+        Err(None) => Err(builtin),
+        Err(Some(why)) => Err(builtin.with_remediation(format!("{why} The built-in engine can't decode this processor, so there is no other list."))),
+    }
+}
+
 fn native_functions_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: PageParams = parse_params(params)?;
     select_document(ctx, &p.document)?;
-    let st = native(ctx)?;
+    let st = match native(ctx) {
+        Ok(st) => st,
+        Err(e) => {
+            let listed = deep_listing(ctx, e)?;
+            let t = ctx.session.active()?;
+            let rows: Vec<Value> = listed
+                .functions
+                .iter()
+                .map(|f| {
+                    let at = listed.rebase.from_engine(f.entry);
+                    let name = t.annotations.names.get(&at).cloned().unwrap_or_else(|| f.name.clone());
+                    json!({"address": hex(at), "name": name, "name_source": if t.annotations.names.contains_key(&at) { "user" } else { "ghidra" }})
+                })
+                .collect();
+            let (items, cov) = page(&rows, p.offset, p.limit);
+            let e = listed
+                .evidence(ctx, "native_functions_list", params_json(&p))?
+                .result(json!({"functions": items, "total": rows.len(), "engine": listed.provider.engine()}))
+                .summary(format!("{} functions from Ghidra's analysis (showing {}).", rows.len(), items.len()))
+                .coverage(cov)
+                .build()?;
+            return Ok(ToolOutput::evidence(e));
+        }
+    };
     let t = ctx.session.active()?;
     let rows: Vec<Value> = st
         .prog
@@ -489,7 +533,40 @@ fn native_functions_search(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutpu
     let p: SearchParams = parse_params(params)?;
     select_document(ctx, &p.document)?;
     let m = Matcher::new(&p.pattern, p.mode, p.case_sensitive)?;
-    let st = native(ctx)?;
+    let st = match native(ctx) {
+        Ok(st) => st,
+        Err(e) => {
+            let listed = deep_listing(ctx, e)?;
+            let img = image(ctx)?;
+            let t = ctx.session.active()?;
+            let mut rows: Vec<Value> = listed
+                .functions
+                .iter()
+                .map(|f| (listed.rebase.from_engine(f.entry), f))
+                .map(|(at, f)| (at, t.annotations.names.get(&at).cloned().unwrap_or_else(|| f.name.clone())))
+                .filter(|(_, name)| m.is_match(name))
+                .map(|(at, name)| json!({"kind": "function", "address": hex(at), "name": name}))
+                .collect();
+            let functions = rows.len();
+            // The file's imports are read without decoding anything.
+            rows.extend(
+                img.0
+                    .bin
+                    .imports
+                    .iter()
+                    .filter(|i| m.is_match(&i.name))
+                    .map(|i| json!({"kind": "import", "address": i.slot.map(hex), "name": i.name, "library": i.library})),
+            );
+            let (items, cov) = page(&rows, p.offset, p.limit);
+            let e = listed
+                .evidence(ctx, "native_functions_search", params_json(&p))?
+                .result(json!({"matches": items, "total": rows.len(), "functions": functions, "imports": rows.len() - functions, "engine": listed.provider.engine()}))
+                .summary(format!("{functions} of Ghidra's functions and {} imports match \"{}\".", rows.len() - functions, p.pattern))
+                .coverage(cov)
+                .build()?;
+            return Ok(ToolOutput::evidence(e));
+        }
+    };
     let t = ctx.session.active()?;
     let mut rows = Vec::new();
     for (i, f) in st.prog.functions.values().enumerate() {

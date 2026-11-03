@@ -458,11 +458,16 @@ pub(super) fn locate(ctx: &mut Ctx<'_>, function: &str) -> Result<(At, u64, Opti
             // Still a program we can place in memory (raw code, or a container we parse), only
             // not one we can decode; anything else fails here as it did above.
             let our_base = image(ctx)?.0.bin.image_base;
-            match deep_at(ctx, function) {
-                Some(at) => Ok((at, our_base, Some(BuiltinGap::Unreadable(e)))),
-                None => Err(e.with_remediation(
-                    "The built-in engine can't decode this processor. In Deep mode, name the function by its address (0x…) or by the name Ghidra gave it (FUN_…).",
-                )),
+            if let Some(at) = deep_at(ctx, function) {
+                return Ok((at, our_base, Some(BuiltinGap::Unreadable(e))));
+            }
+            // A name: Ghidra's list says where it is (`entry`, a symbol it read).
+            let listed = super::native_listing::deep_listing(ctx, e.clone())?;
+            match listed.named(function) {
+                Some(f) => Ok((At::Engine(f.entry), our_base, Some(BuiltinGap::Unreadable(e)))),
+                None => Err(ToolError::invalid(format!("Ghidra's analysis has no function named {}.", function.trim()))
+                    .with_remediation("Find it with native_functions_search (Ghidra's names, in Deep mode), or pass its address (0x…).")
+                    .with_details(serde_json::json!({"reason": "function_not_found", "function": function.trim()}))),
             }
         }
         Err(e) => Err(e),
