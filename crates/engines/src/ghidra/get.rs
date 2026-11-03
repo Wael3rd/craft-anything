@@ -101,12 +101,16 @@ fn fetch(pin: &crate::Pin, store: &Path, folder: &str, what: &str, cancel: Optio
 /// there, and Ghidra then picks a Java by itself. A Ghidra the person installed is left alone.
 /// Returns whether anything changed.
 pub fn keep_on_our_java(launcher: &Path, java: &Path, store: &Path) -> Result<bool, ToolError> {
-    let Some(support) = launcher.parent().filter(|_| launcher.starts_with(store.join(ID))) else {
+    // Only our Ghidra, and only onto our Java: a Java the person set may be one Ghidra 12 can't run on.
+    let Some(support) = launcher.parent().filter(|_| launcher.starts_with(store.join(ID)) && java.starts_with(store.join("jdk"))) else {
         return Ok(false);
     };
     let props = support.join("launch.properties");
     let want = java.display().to_string().replace('\\', "/");
-    let text = std::fs::read_to_string(&props).unwrap_or_default();
+    // A file we can't read is left as it is (rewriting it would drop the settings Ghidra needs).
+    let Ok(text) = std::fs::read_to_string(&props) else {
+        return Ok(false);
+    };
     let named = text.lines().rev().find_map(|l| l.trim_start().strip_prefix("JAVA_HOME_OVERRIDE=")).map(str::trim);
     if named == Some(want.as_str()) {
         return Ok(false);
@@ -118,10 +122,12 @@ pub fn keep_on_our_java(launcher: &Path, java: &Path, store: &Path) -> Result<bo
 fn point_at_java(props: &Path, java: &Path) -> Result<(), ToolError> {
     // Forward slashes: Ghidra reads this file without escapes, and Java takes them on Windows too.
     let line = format!("JAVA_HOME_OVERRIDE={}", java.display().to_string().replace('\\', "/"));
-    let old = std::fs::read_to_string(props).unwrap_or_default();
+    // Never write a file we couldn't read: its other settings (VMARGS Ghidra needs to start) would be lost.
+    let old = std::fs::read_to_string(props).map_err(|e| ToolError::io(props.display(), e))?;
     let mut lines: Vec<String> = old.lines().filter(|l| !l.trim_start().starts_with("JAVA_HOME_OVERRIDE")).map(str::to_string).collect();
     lines.push(line);
-    std::fs::write(props, lines.join("\n") + "\n").map_err(|e| ToolError::io(props.display(), e))
+    // Atomic: the app and the builder's tool server may start Ghidra at the same moment.
+    craft_anything_platform::fs::write_atomic(props, (lines.join("\n") + "\n").as_bytes())
 }
 
 fn launcher(root: &Path) -> Option<PathBuf> {
@@ -223,6 +229,13 @@ mod tests {
         assert!(text.ends_with(&format!("{want}\n")) && text.matches("JAVA_HOME_OVERRIDE").count() == 1, "{text}");
         assert!(text.starts_with("VMARGS=-Xshare:off\n"), "other settings kept: {text}");
         assert!(!keep_on_our_java(&launcher, &java, &store).unwrap(), "already right: not rewritten");
+        // A Java the person set (outside our store) isn't written into our Ghidra.
+        assert!(!keep_on_our_java(&launcher, &d.path().join("their/jdk-17"), &store).unwrap());
+        assert!(std::fs::read_to_string(&props).unwrap().ends_with(&format!("{want}\n")));
+        // A file that can't be read is never replaced by one holding only the override.
+        std::fs::remove_file(&props).unwrap();
+        assert!(!keep_on_our_java(&launcher, &store.join("jdk/jdk-22"), &store).unwrap());
+        assert!(!props.exists());
         // A Ghidra the person installed elsewhere isn't ours to edit.
         let own = d.path().join("tools/ghidra_11.4/support");
         touch(&own.join("analyzeHeadless.bat"));

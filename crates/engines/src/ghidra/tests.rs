@@ -536,6 +536,22 @@ fn java_too_deep_for_windows_is_refused_before_ghidra_blames_java_home() {
     assert!(t.remediation.unwrap_or_default().contains("shorter path"));
     // Only Windows has this limit.
     assert!(java_too_deep(&at(400), false).is_none());
+
+    // Only our Ghidra is refused: one the person installed may name its own Java in its settings.
+    let store = PathBuf::from("C:\\data\\engines");
+    let cfg = |launcher: PathBuf| Config {
+        analyze_headless: launcher,
+        java_home: Some(at(JVM_DLL_PATH_LIMIT + 1)),
+        startup_timeout: Duration::from_secs(1),
+        store_dir: store.clone(),
+        language_id: None,
+        compiler_spec: None,
+        memory_gb: None,
+        load_base: None,
+    };
+    let ours = store.join("ghidra").join("ghidra_12.1.4_PUBLIC").join("support").join("analyzeHeadless.bat");
+    assert!(java_refused(&cfg(ours), true).is_some());
+    assert!(java_refused(&cfg(PathBuf::from("D:\\tools\\ghidra\\support\\analyzeHeadless.bat")), true).is_none());
 }
 
 #[test]

@@ -434,15 +434,25 @@ pub(crate) fn java_too_deep(java_home: &Path, windows: bool) -> Option<GhidraErr
     (len > JVM_DLL_PATH_LIMIT).then(|| GhidraError::JavaTooDeep { path: dll.display().to_string(), len, limit: JVM_DLL_PATH_LIMIT })
 }
 
+/// Our Ghidra, about to start on a Java too deep for Windows, as the error to give instead. A Ghidra
+/// the person installed is left to choose its own Java (its launch.properties may name another).
+pub(crate) fn java_refused(cfg: &Config, windows: bool) -> Option<GhidraError> {
+    let java = cfg.java_home.as_deref()?;
+    if !cfg.analyze_headless.starts_with(cfg.store_dir.join(get::ID)) {
+        return None;
+    }
+    java_too_deep(java, windows)
+}
+
 /// Start `analyzeHeadless` with its home and temp folders inside `runtime_root`.
 fn headless(cfg: &Config, runtime_root: &Path, args: Vec<OsString>, lifetime: Duration) -> Result<RunningProcess, GhidraError> {
-    if let Some(java) = &cfg.java_home {
-        if let Some(e) = java_too_deep(java, cfg!(windows)) {
-            return Err(e);
-        }
-        if let Err(e) = get::keep_on_our_java(&cfg.analyze_headless, java, &cfg.store_dir) {
-            log::warn!("couldn't point Ghidra at the Java in {}: {}", java.display(), e.message);
-        }
+    if let Some(e) = java_refused(cfg, cfg!(windows)) {
+        return Err(e);
+    }
+    if let Some(java) = &cfg.java_home
+        && let Err(e) = get::keep_on_our_java(&cfg.analyze_headless, java, &cfg.store_dir)
+    {
+        log::warn!("couldn't point Ghidra at the Java in {}: {}", java.display(), e.message);
     }
     let mut proc = Process::new(&cfg.analyze_headless)
         .args(&args)
@@ -533,6 +543,8 @@ pub fn analyse(
     let program = format!("target-{}", target_sha256.get(..12).unwrap_or(target_sha256));
     // Beside the saved analysis, so it can be read after a failure.
     let log = project_dir.with_extension("log");
+    // A log left by an earlier run would be taken for this one's (see `failed_analysis`).
+    let _ = std::fs::remove_file(&log);
     remove_soon(&project_dir);
     make_private_dir(&project_dir)?;
     let script_dir = scratch.0.join("scripts");
