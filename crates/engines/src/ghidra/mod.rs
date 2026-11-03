@@ -78,6 +78,12 @@ pub trait DeepDecompiler: Send + Sync {
     fn decompile(&self, entry: u64) -> Result<Option<DeepFunction>, GhidraError>;
     /// List the functions the engine found.
     fn list_functions(&self) -> Result<Vec<DeepFunction>, GhidraError>;
+    /// The entry (in the engine's own space) of the function it calls `name`, if it has one: one
+    /// lookup, without fetching the whole list.
+    fn function_named(&self, name: &str) -> Result<Option<u64>, GhidraError> {
+        let _ = name;
+        Ok(None)
+    }
 }
 
 /// Moves addresses between our built-in engine's view of a program and the Deep engine's, which
@@ -677,7 +683,10 @@ impl DeepDecompiler for Session {
         let v = self.lock().request("native_functions_list", serde_json::json!({}), &never_cancel, Self::request_deadline())?;
         let mut out = Vec::new();
         for f in v.get("functions").and_then(Value::as_array).into_iter().flatten() {
-            let entry = f.get("address").and_then(Value::as_str).and_then(parse_hex).unwrap_or(0);
+            // An address we can't read (an overlay's `OVL::1000`) is left out, never shown as 0.
+            let Some(entry) = f.get("address").and_then(Value::as_str).and_then(parse_hex) else {
+                continue;
+            };
             out.push(DeepFunction {
                 entry,
                 name: f.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
@@ -687,6 +696,15 @@ impl DeepDecompiler for Session {
             });
         }
         Ok(out)
+    }
+
+    fn function_named(&self, name: &str) -> Result<Option<u64>, GhidraError> {
+        let never_cancel = || false;
+        match self.lock().request("native_function_address", serde_json::json!({"function": name}), &never_cancel, Self::request_deadline()) {
+            Ok(v) => Ok(v.get("address").and_then(Value::as_str).and_then(parse_hex)),
+            Err(GhidraError::Bridge { code, .. }) if code == "not_found" => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 

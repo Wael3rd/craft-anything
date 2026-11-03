@@ -109,6 +109,17 @@ fn serve(stream: TcpStream, expected: &str, saw_eof: &Arc<AtomicBool>) {
                 }
                 _ => "{\"name\":\"main\",\"address\":\"0x401000\",\"signature\":\"int main(void)\",\"pseudocode\":\"int main(void){return 0;}\",\"created\":false}".to_string(),
             },
+            // Half a reply, a pause longer than the client's read tick, then the rest.
+            "slow_list" => {
+                let full = format!("{{\"id\":{},\"ok\":true,\"result\":{{\"functions\":[{{\"name\":\"main\",\"address\":\"0x401000\"}}]}}}}\n", req.id);
+                let (first, rest) = full.split_at(full.len() / 2);
+                let _ = writer.write_all(first.as_bytes());
+                let _ = writer.flush();
+                std::thread::sleep(Duration::from_millis(600));
+                let _ = writer.write_all(rest.as_bytes());
+                let _ = writer.flush();
+                continue;
+            }
             "shutdown" => {
                 let _ = writer.write_all(format!("{{\"id\":{},\"ok\":true,\"result\":{{\"shutdown\":true}}}}\n", req.id).as_bytes());
                 break;
@@ -180,6 +191,18 @@ fn bad_token_is_rejected() {
         GhidraError::Bridge { code, .. } => assert_eq!(code, "bad_input"),
         other => panic!("expected a bridge rejection, got {other:?}"),
     }
+    fake.join();
+}
+
+#[test]
+fn a_reply_that_arrives_in_pieces_is_read_whole() {
+    // A big function list can pause mid-line for longer than one read tick (a Java pause); the
+    // bytes read before the pause belong to the same reply.
+    let fake = Fake::start(Mode::Serve, "tok");
+    let mut client = Client::connect(fake.addr, "tok", Instant::now() + Duration::from_secs(5)).expect("connect");
+    let v = client.request("slow_list", serde_json::json!({}), &no_cancel(), Instant::now() + Duration::from_secs(5)).expect("the whole reply");
+    assert_eq!(v["functions"][0]["name"], "main", "{v}");
+    drop(client);
     fake.join();
 }
 

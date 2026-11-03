@@ -55,6 +55,9 @@ impl Client {
         self.writer.write_all(line.as_bytes()).map_err(|e| GhidraError::Connection(e.to_string()))?;
         self.writer.flush().map_err(|e| GhidraError::Connection(e.to_string()))?;
 
+        // Kept across read ticks: a reply longer than one tick (a big function list, or a pause in
+        // the middle of writing it) arrives in pieces, and read_line keeps each piece here.
+        let mut buf = String::new();
         loop {
             if cancel() {
                 return Err(GhidraError::Cancelled);
@@ -62,11 +65,11 @@ impl Client {
             if Instant::now() >= deadline {
                 return Err(GhidraError::Timeout(format!("no reply to {method} within the deadline")));
             }
-            let mut buf = String::new();
             match self.reader.read_line(&mut buf) {
                 Ok(0) => return Err(GhidraError::Connection("the bridge closed the connection".into())),
                 Ok(_) => {
-                    let trimmed = buf.trim();
+                    let line = std::mem::take(&mut buf);
+                    let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
                     }

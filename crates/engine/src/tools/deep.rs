@@ -226,17 +226,36 @@ pub fn decompile(ctx: &mut Ctx<'_>, at: At, our_base: u64) -> Result<Result<Deco
 pub struct Listed {
     pub provider: Arc<dyn DeepDecompiler>,
     /// At the engine's addresses; [`Listed::rebase`] moves them.
-    pub functions: Vec<DeepFunction>,
+    pub functions: Arc<Vec<DeepFunction>>,
     pub rebase: ghidra::Rebase,
 }
 
-impl Listed {
-    /// The function Ghidra named exactly `name` (`FUN_8c02d2a8`, `entry`, a symbol it read).
-    pub fn named(&self, name: &str) -> Option<&DeepFunction> {
-        let name = name.trim();
-        self.functions.iter().find(|f| f.name == name)
-    }
+/// The deep engine's function list, kept on the target for the session that gave it (a new
+/// Ghidra session asks again).
+struct FunctionList {
+    provider: Arc<dyn DeepDecompiler>,
+    functions: Arc<Vec<DeepFunction>>,
+}
 
+/// Where the deep engine's function called `name` starts (in its own space): one lookup by name
+/// (`entry`, a symbol it read), never the whole list. `Err(why)` as for [`decompile`].
+pub fn named(ctx: &mut Ctx<'_>, name: &str) -> Result<Option<u64>, Option<String>> {
+    let provider = provider_for_active(ctx)?;
+    match provider.function_named(name.trim()) {
+        Ok(entry) => Ok(entry),
+        Err(e) => {
+            log::warn!("Ghidra couldn't look up {name}: {e}");
+            if matches!(e, ghidra::GhidraError::Connection(_) | ghidra::GhidraError::Protocol(_))
+                && let Ok(t) = ctx.session.active_mut()
+            {
+                t.ext.remove::<DeepSlot>();
+            }
+            Err(Some(format!("Ghidra couldn't look the name up ({e}).")))
+        }
+    }
+}
+
+impl Listed {
     /// Evidence for `operation` answered from this list: the engine is recorded as Ghidra.
     pub fn evidence(&self, ctx: &Ctx<'_>, operation: &str, params: serde_json::Value) -> Result<EvidenceBuilder, ToolError> {
         let subject = ctx.session.active()?.target.subject();
@@ -267,9 +286,20 @@ impl Listed {
 pub fn functions(ctx: &mut Ctx<'_>, our_base: u64) -> Result<Result<Listed, ToolError>, Option<String>> {
     let provider = provider_for_active(ctx)?;
     let rebase = ghidra::Rebase::new(our_base, provider.image_base());
+    // Asked once per Ghidra session: paging through a big game's list must not fetch it again.
+    if let Ok(t) = ctx.session.active()
+        && let Some(cached) = t.ext.get::<FunctionList>()
+        && Arc::ptr_eq(&cached.provider, &provider)
+    {
+        return Ok(Ok(Listed { provider, functions: cached.functions.clone(), rebase }));
+    }
     match provider.list_functions() {
         Ok(mut functions) => {
             functions.sort_by_key(|f| f.entry);
+            let functions = Arc::new(functions);
+            if let Ok(t) = ctx.session.active_mut() {
+                t.ext.insert(Arc::new(FunctionList { provider: provider.clone(), functions: functions.clone() }));
+            }
             Ok(Ok(Listed { provider, functions, rebase }))
         }
         Err(ghidra::GhidraError::Cancelled) => Ok(Err(ToolError::cancelled())),
@@ -361,6 +391,8 @@ mod tests {
     struct Moved {
         base: u64,
         asked: AtomicU64,
+        /// How many times its whole function list was asked for.
+        lists: AtomicU64,
     }
 
     impl DeepDecompiler for Moved {
@@ -381,10 +413,21 @@ mod tests {
             let pseudocode = Some(format!("int FUN_{entry:08x}(void) {{ return 0; }}"));
             Ok(Some(DeepFunction { entry, name: format!("FUN_{entry:08x}"), signature: None, pseudocode, created: false }))
         }
-        /// Its analysis found the entry point and one function after it.
+        /// Its analysis found the entry point, one function after it and a thunk (whose name is made
+        /// up as it's shown, so only the list has it).
         fn list_functions(&self) -> Result<Vec<DeepFunction>, ghidra::GhidraError> {
             let f = |entry: u64, name: String| DeepFunction { entry, name, signature: None, pseudocode: None, created: false };
-            Ok(vec![f(self.base + 4, format!("FUN_{:08x}", self.base + 4)), f(self.base, "entry".into())])
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            let thunk = f(self.base + 8, format!("thunk_FUN_{:08x}", self.base));
+            Ok(vec![f(self.base + 4, format!("FUN_{:08x}", self.base + 4)), f(self.base, "entry".into()), thunk])
+        }
+        /// `entry` is its name for the start; `add` (which also reads as hex) for the one after.
+        fn function_named(&self, name: &str) -> Result<Option<u64>, ghidra::GhidraError> {
+            Ok(match name {
+                "entry" => Some(self.base),
+                "add" => Some(self.base + 4),
+                _ => None,
+            })
         }
     }
 
@@ -393,7 +436,7 @@ mod tests {
         let (elf, l) = tk::elf64(tk::ElfArch::X86_64, true);
         let e = engine_with("prog", &elf);
         const SHIFT: u64 = 0x10_0000;
-        let moved = Arc::new(Moved { base: tk::ELF_BASE + SHIFT, asked: AtomicU64::new(0) });
+        let moved = Arc::new(Moved { base: tk::ELF_BASE + SHIFT, asked: AtomicU64::new(0), lists: AtomicU64::new(0) });
         {
             let mut s = e.session();
             s.settings.deep_mode = true;
@@ -432,7 +475,7 @@ mod tests {
         call(&e, "core_target_open", pinned);
 
         // Ghidra (a stand-in) loaded it where it runs, so addresses cross unchanged.
-        let ghidra = Arc::new(Moved { base: 0x8c01_0000, asked: AtomicU64::new(0) });
+        let ghidra = Arc::new(Moved { base: 0x8c01_0000, asked: AtomicU64::new(0), lists: AtomicU64::new(0) });
         {
             let mut s = e.session();
             let provider: Arc<dyn DeepDecompiler> = ghidra.clone();
@@ -457,11 +500,19 @@ mod tests {
         assert!(r["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "deep_engine"), "{r}");
         let err = call_err(&e, "native_function_pseudocode", json!({"function": "main"}));
         assert!(err.message.contains("no function named main"), "{err:?}");
+        // A name that also reads as hex is a name first.
+        let r = call(&e, "native_function_pseudocode", json!({"function": "add"}));
+        assert_eq!(r["result"]["entry"], "0x8c010004", "{r}");
+        // A name only the list has (a thunk's): the list is asked for once, then kept.
+        let r = call(&e, "native_function_pseudocode", json!({"function": "thunk_FUN_8c010000"}));
+        assert_eq!(r["result"]["entry"], "0x8c010008", "{r}");
+        assert_eq!(ghidra.lists.load(Ordering::SeqCst), 1, "one list for every name it didn't know");
 
-        // Ghidra's list stands in for the built-in engine's: listed and searched by its names.
+        // Ghidra's list stands in for the built-in engine's: listed and searched by its names,
+        // asked for once however many pages are read.
         let r = call(&e, "native_functions_list", json!({}));
         assert_eq!(r["environment"]["engine"], "ghidra", "{r}");
-        assert_eq!(r["result"]["total"], 2, "{r}");
+        assert_eq!(r["result"]["total"], 3, "{r}");
         assert_eq!(r["result"]["functions"][0]["address"], "0x8c010000", "in address order");
         assert_eq!(r["result"]["functions"][0]["name"], "entry");
         assert!(r["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "deep_engine"), "{r}");
@@ -469,6 +520,8 @@ mod tests {
         let r = call(&e, "native_functions_search", json!({"pattern": "^(entry|boot)$", "mode": "regex"}));
         assert_eq!(r["result"]["functions"], 2, "your names count too: {r}");
         assert_eq!(r["confidence"], "derived");
+        call(&e, "native_functions_list", json!({"offset": 1}));
+        assert_eq!(ghidra.lists.load(Ordering::SeqCst), 1);
 
         // Without Ghidra there's no answer: the built-in engine says it can't decode this
         // processor, and why Ghidra didn't answer.
@@ -500,7 +553,7 @@ mod tests {
     fn an_engine_at_our_base_gets_our_addresses_unchanged() {
         let (elf, l) = tk::elf64(tk::ElfArch::X86_64, true);
         let e = engine_with("prog", &elf);
-        let same = Arc::new(Moved { base: tk::ELF_BASE, asked: AtomicU64::new(0) });
+        let same = Arc::new(Moved { base: tk::ELF_BASE, asked: AtomicU64::new(0), lists: AtomicU64::new(0) });
         {
             let mut s = e.session();
             s.settings.deep_mode = true;
