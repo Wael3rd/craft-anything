@@ -493,7 +493,8 @@ Owner: open · Status: in progress
       slot), `exports`, `libraries` and `details.psp_module`; corrupt tables give warnings
 - [ ] PSP imports and exports have no names, only NIDs: a name table (built by us, from names we
       hash ourselves, not copied from another project) would let `<Library>_<NID>` read as a function
-      name; variable imports keep their NIDs in `details.psp_module` but have no stub address
+      name; imported variables are only counted (`details.psp_module`): where their NIDs are kept
+      isn't read yet
 - [ ] Triage doesn't recognise `PARAM.SFO` (PSF: a NUL byte then `PSF`, key and data tables: TITLE, DISC_ID,
       CATEGORY, PSP_SYSTEM_VER) or an encrypted PSP executable (`~PSP` header, `EBOOT.BIN`/`.PRX`: it
       must be decrypted first, and triage should say so)

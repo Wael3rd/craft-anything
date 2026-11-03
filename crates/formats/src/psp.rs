@@ -22,6 +22,9 @@ const MAX_LIBRARIES: usize = 1024;
 /// The most NIDs read from one module's import (or export) tables in all: every library may point
 /// at the same table, so a cap per library alone lets a small file ask for gigabytes.
 const MAX_NIDS: usize = MAX_IMPORTS;
+/// The most NIDs read from the export tables in all: a module exports a handful (a system library
+/// some hundreds), and each export function is looked up in the sections.
+const MAX_EXPORT_NIDS: usize = 16_384;
 /// Most characters kept of a library or module name.
 const MAX_NAME: usize = 64;
 /// Bytes in one function stub (a jump and its delay slot).
@@ -130,7 +133,7 @@ pub fn enrich(data: &[u8], b: &mut Binary, e_type: u16, info_hint: Option<u64>) 
             "version": format!("{:#06x}", l.version),
             "flags": format!("{:#06x}", l.flags),
             "functions": l.functions.len(),
-            "variables": l.variables.iter().map(|n| format!("0x{}", nid_text(*n))).collect::<Vec<_>>(),
+            "variables": l.variables,
         }));
         for (nid, stub_addr) in &l.functions {
             if b.imports.len() >= MAX_IMPORTS {
@@ -225,7 +228,8 @@ struct ImportLib {
     flags: u16,
     /// (NID, stub address when it lies inside the file's image).
     functions: Vec<(u32, Option<u64>)>,
-    variables: Vec<u32>,
+    /// How many variables it imports (their NIDs aren't read).
+    variables: usize,
 }
 
 fn read_stubs(data: &[u8], b: &mut Binary, range: Option<(u64, u64)>) -> Vec<ImportLib> {
@@ -258,28 +262,31 @@ fn read_stubs(data: &[u8], b: &mut Binary, range: Option<(u64, u64)>) -> Vec<Imp
                 format!("library_{pos:x}")
             }
         };
-        let mut lib = ImportLib { name, version, flags, functions: Vec::new(), variables: Vec::new() };
-        let listed = usize::from(func_count).saturating_add(var_count);
-        let total = listed.min(nids_left);
-        nids_left -= total;
-        if total < listed {
+        // The NID table holds the functions' NIDs, one per stub. Imported variables are counted
+        // only: where their NIDs are kept isn't read.
+        let mut lib = ImportLib { name, version, flags, functions: Vec::new(), variables: var_count };
+        let listed = usize::from(func_count);
+        let wanted = listed.min(nids_left);
+        nids_left -= wanted;
+        if wanted < listed {
             b.warnings.push(format!("PSP imports: stopped at {MAX_NIDS} NIDs in all"));
         }
-        let mut nids = Vec::new();
-        for i in 0..total {
-            let Some(nid) = u64::from(nid_ptr).checked_add(4 * i as u64).and_then(|a| u32_at(b, data, a)) else {
-                b.warnings.push(format!("PSP imports: {} lists {total} NIDs but only {i} are in the file", lib.name));
-                break;
-            };
-            nids.push(nid);
+        // One read for the whole table (a lookup per NID costs a search of every section).
+        let table = b.read(data, u64::from(nid_ptr), wanted.saturating_mul(4)).unwrap_or_default();
+        let nids: Vec<u32> = table.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+        if nids.len() < wanted {
+            b.warnings.push(format!("PSP imports: {} lists {wanted} NIDs but only {} are in the file", lib.name, nids.len()));
         }
+        // The stubs are 8 bytes each, back to back: mapped when the first and last are in one section.
+        let stub_at = |i: usize| (i as u64).checked_mul(STUB_LEN).and_then(|o| u64::from(stub_ptr).checked_add(o));
+        let last = nids.len().checked_sub(1).and_then(stub_at);
+        let all_mapped = match (stub_at(0).and_then(|a| b.section_at(a)), last.and_then(|a| b.section_at(a))) {
+            (Some(first), Some(end)) => std::ptr::eq(first, end),
+            _ => false,
+        };
         for (i, nid) in nids.iter().enumerate() {
-            if i < usize::from(func_count) {
-                let addr = (i as u64).checked_mul(STUB_LEN).and_then(|o| u64::from(stub_ptr).checked_add(o)).filter(|a| b.is_mapped(*a));
-                lib.functions.push((*nid, addr));
-            } else {
-                lib.variables.push(*nid);
-            }
+            let addr = stub_at(i).filter(|a| all_mapped || b.is_mapped(*a));
+            lib.functions.push((*nid, addr));
         }
         out.push(lib);
         match words.checked_mul(4).and_then(|n| pos.checked_add(n)) {
@@ -305,7 +312,7 @@ fn read_entries(data: &[u8], b: &mut Binary, range: Option<(u64, u64)>) -> Vec<E
     let mut out = Vec::new();
     let Some((top, end)) = range else { return out };
     let mut pos = top;
-    let mut nids_left = MAX_NIDS;
+    let mut nids_left = MAX_EXPORT_NIDS;
     while pos < end && out.len() < MAX_LIBRARIES {
         let (Some(name_ptr), Some(version), Some(attributes), Some(size_vars), Some(func_count), Some(table)) = (
             u32_at(b, data, pos),
@@ -330,13 +337,18 @@ fn read_entries(data: &[u8], b: &mut Binary, range: Option<(u64, u64)>) -> Vec<E
         let total = listed.min(nids_left);
         nids_left -= total;
         if total < listed {
-            b.warnings.push(format!("PSP exports: stopped at {MAX_NIDS} NIDs in all"));
+            b.warnings.push(format!("PSP exports: stopped at {MAX_EXPORT_NIDS} NIDs in all"));
         }
-        // The NIDs come first, then one address per NID (the table's own count places them).
+        // The NIDs come first, then one address per NID (the table's own count places them). One
+        // read for the whole table: a lookup per word costs a search of every section.
+        let words_at = |va: Option<u64>| {
+            let bytes = va.and_then(|va| b.read(data, va, total.saturating_mul(4))).unwrap_or_default();
+            bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect::<Vec<u32>>()
+        };
+        let nids = words_at(Some(u64::from(table)));
+        let addrs = words_at((listed as u64).checked_mul(4).and_then(|o| u64::from(table).checked_add(o)));
         for i in 0..total {
-            let nid_va = u64::from(table).checked_add(4 * i as u64);
-            let addr_va = u64::from(table).checked_add(4 * (listed as u64 + i as u64));
-            let (Some(nid), Some(addr)) = (nid_va.and_then(|a| u32_at(b, data, a)), addr_va.and_then(|a| u32_at(b, data, a))) else {
+            let (Some(&nid), Some(&addr)) = (nids.get(i), addrs.get(i)) else {
                 b.warnings.push(format!("PSP exports: {} lists {total} entries but only {i} are in the file", lib.name.as_deref().unwrap_or("(system)")));
                 break;
             };
@@ -415,7 +427,9 @@ mod module_tests {
         assert_eq!(json["nid"], "0x000000AB");
         let libs = &b.details["psp_module"]["import_libraries"];
         assert_eq!(libs[0]["functions"], 2);
-        assert_eq!(libs[0]["variables"][0], "0x12345678");
+        // Counted, not read: the NID after the functions' belongs to the next table, not to the variable.
+        assert_eq!(libs[0]["variables"], 1);
+        assert!(b.imports.iter().all(|i| i.nid != Some(0x1234_5678)));
     }
 
     #[test]
@@ -481,7 +495,7 @@ mod module_tests {
         let mut b = Binary::raw(Arch::Mips, 0, data.len() as u64, 0);
         let started = std::time::Instant::now();
         let libs = read_stubs(&data, &mut b, Some((0, table)));
-        let read: usize = libs.iter().map(|l| l.functions.len() + l.variables.len()).sum();
+        let read: usize = libs.iter().map(|l| l.functions.len()).sum();
         assert!(read <= MAX_NIDS, "{read}");
         assert!(b.warnings.iter().any(|w| w.contains("NIDs in all")), "{:?}", b.warnings.first());
         assert!(started.elapsed() < std::time::Duration::from_secs(10));

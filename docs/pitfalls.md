@@ -200,6 +200,12 @@ reads files itself (`pending`, `secrets`, `layers`, `locks`, `tools --check`…)
 at the wrong tree (the cargo commands `ci` runs use the folder they're started in). Give every
 worktree its own `CARGO_TARGET_DIR`, and rebuild `xtask` (or delete it from `target/`) after
 sharing one.
+It happened again with cargo itself: worktrees shared the main checkout's target folder to spare
+Smart App Control new files to judge, and cargo records a crate's sources relative to the crate,
+so a crate built in one worktree counted as fresh in another whose copy was older. The PSP branch
+compiled against the disc-image branch's `formats` and failed, and earlier test runs had quietly
+used crates from other branches. To re-check several branches in one checkout, check them out in
+turn and touch every source first.
 
 **Stopping a long run leaves children behind** unless every program goes through
 `craft_anything_platform::process`. After stopping one, check that its child processes are gone.
