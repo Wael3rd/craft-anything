@@ -96,6 +96,24 @@ fn fetch(pin: &crate::Pin, store: &Path, folder: &str, what: &str, cancel: Optio
     swapped
 }
 
+/// Point a Ghidra we installed (its `launcher` is in `store`) at `java` again when its
+/// launch.properties names another folder: a portable copy that was moved keeps the old path
+/// there, and Ghidra then picks a Java by itself. A Ghidra the person installed is left alone.
+/// Returns whether anything changed.
+pub fn keep_on_our_java(launcher: &Path, java: &Path, store: &Path) -> Result<bool, ToolError> {
+    let Some(support) = launcher.parent().filter(|_| launcher.starts_with(store.join(ID))) else {
+        return Ok(false);
+    };
+    let props = support.join("launch.properties");
+    let want = java.display().to_string().replace('\\', "/");
+    let text = std::fs::read_to_string(&props).unwrap_or_default();
+    let named = text.lines().rev().find_map(|l| l.trim_start().strip_prefix("JAVA_HOME_OVERRIDE=")).map(str::trim);
+    if named == Some(want.as_str()) {
+        return Ok(false);
+    }
+    point_at_java(&props, java).map(|()| true)
+}
+
 /// Ghidra's supported way to choose its Java: `JAVA_HOME_OVERRIDE` in support/launch.properties.
 fn point_at_java(props: &Path, java: &Path) -> Result<(), ToolError> {
     // Forward slashes: Ghidra reads this file without escapes, and Java takes them on Windows too.
@@ -186,6 +204,31 @@ mod tests {
         point_at_java(&props, Path::new(r"C:\store\jdk\jdk-21")).unwrap();
         let text = std::fs::read_to_string(&props).unwrap();
         assert_eq!(text, "VMARGS=-Xshare:off\nJAVA_HOME_OVERRIDE=C:/store/jdk/jdk-21\n");
+    }
+
+    #[test]
+    fn a_moved_install_is_pointed_at_its_java_again_and_the_persons_own_ghidra_is_left_alone() {
+        let d = tempfile::tempdir().unwrap();
+        let store = d.path().join("moved/CraftAnythingData/engines");
+        let support = store.join("ghidra/ghidra_12.1.4_PUBLIC/support");
+        let launcher = support.join("analyzeHeadless.bat");
+        touch(&launcher);
+        let props = support.join("launch.properties");
+        // Installed somewhere else, then the portable folder moved.
+        std::fs::write(&props, "VMARGS=-Xshare:off\nJAVA_HOME_OVERRIDE=C:/old/CraftAnythingData/engines/jdk/jdk-21\n").unwrap();
+        let java = store.join("jdk/jdk-21");
+        assert!(keep_on_our_java(&launcher, &java, &store).unwrap(), "the stale path is replaced");
+        let want = format!("JAVA_HOME_OVERRIDE={}", java.display().to_string().replace('\\', "/"));
+        let text = std::fs::read_to_string(&props).unwrap();
+        assert!(text.ends_with(&format!("{want}\n")) && text.matches("JAVA_HOME_OVERRIDE").count() == 1, "{text}");
+        assert!(text.starts_with("VMARGS=-Xshare:off\n"), "other settings kept: {text}");
+        assert!(!keep_on_our_java(&launcher, &java, &store).unwrap(), "already right: not rewritten");
+        // A Ghidra the person installed elsewhere isn't ours to edit.
+        let own = d.path().join("tools/ghidra_11.4/support");
+        touch(&own.join("analyzeHeadless.bat"));
+        std::fs::write(own.join("launch.properties"), "JAVA_HOME_OVERRIDE=C:/their/jdk\n").unwrap();
+        assert!(!keep_on_our_java(&own.join("analyzeHeadless.bat"), &java, &store).unwrap());
+        assert_eq!(std::fs::read_to_string(own.join("launch.properties")).unwrap(), "JAVA_HOME_OVERRIDE=C:/their/jdk\n");
     }
 
     #[test]

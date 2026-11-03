@@ -519,3 +519,51 @@ fn a_bridge_that_stops_early_leaves_its_log_beside_the_analysis() {
     assert_eq!(keep_log(&[&none], &d.path().join("other.bridge.log")), none);
     assert!(!d.path().join("other.bridge.log").exists());
 }
+
+#[test]
+fn java_too_deep_for_windows_is_refused_before_ghidra_blames_java_home() {
+    // Sized so the path to jvm.dll is exactly `len` characters, as measured on Windows.
+    let at = |len: usize| {
+        let tail = ["bin", "server", "jvm.dll"].iter().map(|s| s.len() + 1).sum::<usize>();
+        PathBuf::from(format!("C:\\{}", "j".repeat(len - tail - 3)))
+    };
+    assert!(java_too_deep(&at(JVM_DLL_PATH_LIMIT), true).is_none(), "250 characters start");
+    let e = java_too_deep(&at(JVM_DLL_PATH_LIMIT + 1), true).expect("251 don't");
+    assert!(matches!(e, GhidraError::JavaTooDeep { len: 251, limit: 250, .. }), "{e:?}");
+    let said = e.to_string();
+    assert!(said.contains("251 characters") && said.contains("jvm.dll") && said.contains("shorter"), "{said}");
+    let t = e.into_tool_error();
+    assert!(t.remediation.unwrap_or_default().contains("shorter path"));
+    // Only Windows has this limit.
+    assert!(java_too_deep(&at(400), false).is_none());
+}
+
+#[test]
+fn an_analysis_that_fails_before_ghidra_writes_its_log_keeps_what_the_launcher_said() {
+    use craft_anything_platform::process::Output;
+    let out = |stdout: &str, stderr: &str| Output {
+        code: Some(1),
+        success: false,
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        duration: Duration::from_secs(1),
+    };
+    let d = tempfile::tempdir().unwrap();
+    // The launcher stopped before Java: its words become the log the error points at.
+    let log = d.path().join("project.log");
+    let said = "WARNING: JAVA_HOME environment variable is set to an invalid directory: C:\\x\n\nERROR: The 'java' command could not be found in your PATH or with JAVA_HOME.\n";
+    let e = failed_analysis(&log, &out(said, ""));
+    let m = e.to_string();
+    assert!(m.contains("could not be found in your PATH") && m.contains(&log.display().to_string()), "{m}");
+    assert!(std::fs::read_to_string(&log).unwrap().contains("JAVA_HOME environment variable"));
+    // Ghidra's own log is never replaced.
+    std::fs::write(&log, "ghidra's own analysis log").unwrap();
+    let _ = failed_analysis(&log, &out("", "something else"));
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "ghidra's own analysis log");
+    // Nothing printed and no log: no log is named.
+    let nothing = d.path().join("nothing.log");
+    let m = failed_analysis(&nothing, &out("", " \n")).to_string();
+    assert!(!m.contains("see ") && !nothing.exists(), "{m}");
+}

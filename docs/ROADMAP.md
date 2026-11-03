@@ -490,9 +490,12 @@ Owner: open · Status: in progress
 - [ ] Disc images: triage doesn't recognise an ISO 9660 image, a `.cue` or its `.bin` tracks
       (`core_archive_show` calls a PSP ISO "text"); `firmware_regions_list` finds the ISO 9660, but
       nothing extracts its files
-- [ ] The managed Java doesn't start from a deep folder (its `jvm.dll` path past ~250 characters):
-      Ghidra's launcher then blames `JAVA_HOME`, and our error points at an analysis log that was
-      never written
+- [x] Java in a folder too deep for Windows (more than 250 characters to its `jvm.dll`, measured)
+      is refused before Ghidra starts, saying so and to move the folder (`GhidraError::JavaTooDeep`),
+      instead of Ghidra's launcher blaming `JAVA_HOME`; an analysis that fails before Ghidra writes
+      its log keeps what the launcher printed there, and the error quotes its last line
+- [x] A moved portable copy points its Ghidra at its own Java again: `JAVA_HOME_OVERRIDE` in the
+      managed Ghidra's `launch.properties` kept the old folder, so Ghidra picked a Java by itself
 - [ ] Ghidra's raw loader is given no entry point, so a raw program has no functions until one is
       asked for (each is made on demand)
 - [ ] `deep::prepare` (the builder's analysis ahead of time) builds its cache key without a target's

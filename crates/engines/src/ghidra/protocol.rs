@@ -39,6 +39,11 @@ pub struct WireError {
 pub enum GhidraError {
     #[error("could not start Ghidra: {0}")]
     Launch(String),
+    /// Java is in a folder too deep for Windows to load it (`path` is its `jvm.dll`).
+    #[error(
+        "Windows can't start Java from {path}: that path is {len} characters, and at most {limit} work. Move the folder Java is in (Craft Anything's own, when it's a portable copy) somewhere shorter, such as C:\\CraftAnything"
+    )]
+    JavaTooDeep { path: String, len: usize, limit: usize },
     #[error("Ghidra timed out: {0}")]
     Timeout(String),
     #[error("the Ghidra bridge connection failed: {0}")]
@@ -57,6 +62,8 @@ impl GhidraError {
         match self {
             GhidraError::Launch(m) => ToolError::new(ErrorCode::EngineMissing, format!("Ghidra could not start: {m}"))
                 .with_remediation("Check the Ghidra install and JDK in Settings → Engines."),
+            e @ GhidraError::JavaTooDeep { .. } => ToolError::new(ErrorCode::EngineMissing, format!("Ghidra could not start: {e}"))
+                .with_remediation("Move Craft Anything's folder (or the Java set in Settings → Engines) to a shorter path, such as C:\\CraftAnything."),
             GhidraError::Timeout(m) => ToolError::new(ErrorCode::TimedOut, m)
                 .with_remediation("Give Ghidra more time with engines.ghidra.startup_timeout_secs, or analyse a smaller target."),
             GhidraError::Connection(m) => ToolError::new(ErrorCode::EngineMissing, format!("Lost the Ghidra bridge: {m}")),

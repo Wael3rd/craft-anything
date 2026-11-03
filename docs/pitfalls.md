@@ -140,6 +140,12 @@ Its symptom misled people too: Claude Code's MCP log says `Executable not found 
 for any command that won't start, so #64 went looking for a bad config. Reproduce with the real
 program before believing what a log's wording suggests.
 
+**A message that blamed the wrong thing.** A portable copy unpacked in a deep folder put Java's
+`jvm.dll` 251 characters down; Windows wouldn't load it, Ghidra's launcher said `JAVA_HOME` was
+invalid, and our error named an analysis log Ghidra never got to write. Measure a limit like this
+(here: 250 characters start, 251 don't) and check it before starting the program; when a program
+fails before writing its log, keep what it printed instead of pointing at nothing.
+
 **A Windows path with forward slashes read as nothing.** rtl_433 decoded a recording in the shell
 but found no messages, and exited 0, when the test passed `C:/…/x.cu8`; it only reads Windows
 paths with backslashes. Hand external programs native paths (`\` on Windows), and give each

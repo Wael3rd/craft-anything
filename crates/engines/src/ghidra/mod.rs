@@ -381,6 +381,22 @@ impl Drop for Scratch {
     }
 }
 
+/// An analysis that ended in failure, pointing at a log that exists: Ghidra's launcher can stop
+/// before Java starts (no usable Java), so before Ghidra writes its log, and then what the
+/// launcher printed is kept there instead. The error quotes its last line.
+pub(crate) fn failed_analysis(log: &Path, out: &craft_anything_platform::process::Output) -> GhidraError {
+    let printed = [out.stdout.as_slice(), out.stderr.as_slice()].join(&b"\n"[..]);
+    let ghidra_wrote = std::fs::metadata(log).is_ok_and(|m| m.len() > 0);
+    if !ghidra_wrote && !printed.iter().all(u8::is_ascii_whitespace) {
+        let _ = std::fs::write(log, &printed);
+    }
+    let text = String::from_utf8_lossy(&printed);
+    let last = text.lines().map(str::trim).rfind(|l| !l.is_empty()).map(|l| l.chars().take(300).collect::<String>());
+    let said = last.map(|l| format!(" ({l})")).unwrap_or_default();
+    let see = if std::fs::metadata(log).is_ok() { format!("; see {}", log.display()) } else { String::new() };
+    GhidraError::Launch(format!("Ghidra's analysis failed{said}{see}"))
+}
+
 /// Copy the logs of a bridge that stopped early to `dest` beside the saved analysis (the runtime
 /// folder they're in is removed with the error), and return where to read them: `dest`, or the
 /// first log if nothing could be copied.
@@ -403,8 +419,31 @@ fn remove_soon(dir: &Path) {
     }
 }
 
+/// The longest path to Java's `jvm.dll` that `java.exe` still loads on Windows: measured with the
+/// JDK 21 we install, 250 characters start and 251 stop at "Failed to load …jvm.dll".
+pub(crate) const JVM_DLL_PATH_LIMIT: usize = 250;
+
+/// Java in a folder too deep for Windows to start it (`windows`: the check applies), as an error
+/// that says so. Ghidra's launcher would only say JAVA_HOME is invalid.
+pub(crate) fn java_too_deep(java_home: &Path, windows: bool) -> Option<GhidraError> {
+    if !windows {
+        return None;
+    }
+    let dll = java_home.join("bin").join("server").join("jvm.dll");
+    let len = dll.to_string_lossy().encode_utf16().count();
+    (len > JVM_DLL_PATH_LIMIT).then(|| GhidraError::JavaTooDeep { path: dll.display().to_string(), len, limit: JVM_DLL_PATH_LIMIT })
+}
+
 /// Start `analyzeHeadless` with its home and temp folders inside `runtime_root`.
 fn headless(cfg: &Config, runtime_root: &Path, args: Vec<OsString>, lifetime: Duration) -> Result<RunningProcess, GhidraError> {
+    if let Some(java) = &cfg.java_home {
+        if let Some(e) = java_too_deep(java, cfg!(windows)) {
+            return Err(e);
+        }
+        if let Err(e) = get::keep_on_our_java(&cfg.analyze_headless, java, &cfg.store_dir) {
+            log::warn!("couldn't point Ghidra at the Java in {}: {}", java.display(), e.message);
+        }
+    }
     let mut proc = Process::new(&cfg.analyze_headless)
         .args(&args)
         .env("HOME", runtime_root.join("home"))
@@ -519,7 +558,7 @@ pub fn analyse(
             return Err(GhidraError::Cancelled);
         }
         if let Some(r) = running.wait_timeout(Duration::from_millis(500)) {
-            break r.as_ref().map(|o| o.success).map_err(|e| e.message.clone());
+            break r.as_ref().map(|o| o.success.then_some(()).ok_or_else(|| failed_analysis(&log, o))).map_err(|e| e.message.clone());
         }
         if last_progress.elapsed() >= Duration::from_secs(10) {
             // Keeps the lock fresh, so waiters know this analysis is alive.
@@ -530,9 +569,9 @@ pub fn analyse(
         }
     };
     match done {
-        Ok(true) => write_atomic_private(&project_dir.join(ANALYSED_MARKER), program.as_bytes())
+        Ok(Ok(())) => write_atomic_private(&project_dir.join(ANALYSED_MARKER), program.as_bytes())
             .map_err(|e| GhidraError::Launch(format!("saving the analysis: {e}")))?,
-        Ok(false) => return Err(GhidraError::Launch(format!("Ghidra's analysis failed; see {}", log.display()))),
+        Ok(Err(failed)) => return Err(failed),
         Err(m) => return Err(GhidraError::Timeout(m)),
     }
     drop(held);
