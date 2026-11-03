@@ -1,7 +1,7 @@
 //! Native inventories: functions, segments, strings, names, documents, bookmarks; searches;
 //! raw bytes; address ↔ file offset; cross-references; reading names and comments.
 
-use super::native_common::{DEFAULT_LIMIT, address_or_cursor, ev, hex, image, name_of, native, page, params_json, select_document, spec};
+use super::native_common::{DEFAULT_LIMIT, address_or_cursor, ev, hex, image, name_of, native, page, params_json, select_document, spec, strings_source};
 use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
 use craft_anything_disasm::slot_label;
 use craft_anything_evidence::{Confidence, Coverage, ErrorCode, Limitation, Location, ToolError};
@@ -39,7 +39,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "native_strings_browse",
             "List strings",
-            "Printable strings (ASCII, UTF-8, UTF-16) in data sections with their addresses and how many places use them. Optional filters: one address, one section (`.rdata`); native_strings_find finds text. Paged.",
+            "Printable strings (ASCII, UTF-8, UTF-16) in data sections with their addresses and how many places use them (null when the built-in engine can't decode the program's processor). Optional filters: one address, one section (`.rdata`); native_strings_find finds text. Paged.",
             "See the text inside the program.",
             Native,
             e,
@@ -94,7 +94,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "native_strings_find",
             "Search strings",
-            "Complete, deterministic search of the program's strings. mode literal or regex; case-insensitive unless case_sensitive. Paged.",
+            "Complete, deterministic search of the program's strings, with the code that uses each (null when the built-in engine can't decode the program's processor). mode literal or regex; case-insensitive unless case_sensitive. Paged.",
             "Find text inside the program.",
             Native,
             e,
@@ -401,13 +401,13 @@ fn native_sections_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
 fn native_strings_browse(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: StringsParams = parse_params(params)?;
     select_document(ctx, &p.document)?;
-    let st = native(ctx)?;
+    let src = strings_source(ctx)?;
     let filter = p.address.as_deref().map(super::parse_address).transpose()?;
     let section = p.section.as_deref().map(str::trim).filter(|s| !s.is_empty());
     if let Some(want) = section
-        && !st.prog.strings.iter().any(|s| s.section.eq_ignore_ascii_case(want))
+        && !src.strings().iter().any(|s| s.section.eq_ignore_ascii_case(want))
     {
-        let mut have: Vec<&str> = st.prog.strings.iter().map(|s| s.section.as_str()).collect();
+        let mut have: Vec<&str> = src.strings().iter().map(|s| s.section.as_str()).collect();
         have.sort_unstable();
         have.dedup();
         return Err(ToolError::new(ErrorCode::NotFound, format!("No strings in a section named {want:?}.")).with_remediation(if have.is_empty() {
@@ -416,13 +416,14 @@ fn native_strings_browse(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput,
             format!("Sections with strings: {}.", have.join(", "))
         }));
     }
-    let rows: Vec<Value> = st
-        .prog
-        .strings
+    // Unknown (null), not 0, when the code couldn't be read.
+    let uses = |a: u64| src.program().map(|prog| prog.xrefs_to.get(&a).map(Vec::len).unwrap_or(0));
+    let rows: Vec<Value> = src
+        .strings()
         .iter()
         .filter(|s| filter.is_none_or(|a| a >= s.addr && a < s.addr.saturating_add(s.byte_len.max(1))))
         .filter(|s| section.is_none_or(|want| s.section.eq_ignore_ascii_case(want)))
-        .map(|s| json!({"address": hex(s.addr), "text": s.text, "encoding": s.encoding, "section": s.section, "file_offset": s.file_offset, "references": st.prog.xrefs_to.get(&s.addr).map(Vec::len).unwrap_or(0)}))
+        .map(|s| json!({"address": hex(s.addr), "text": s.text, "encoding": s.encoding, "section": s.section, "file_offset": s.file_offset, "references": uses(s.addr)}))
         .collect();
     let (items, cov) = page(&rows, p.offset, p.limit);
     let mut b = ev(ctx, "native_strings_browse", params_json(&p))?
@@ -433,6 +434,7 @@ fn native_strings_browse(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput,
         b = b.location(Location::address(a));
     }
     b = b.limitation(Limitation::new("data_sections_only", "strings are read from data sections; text built at run time or stored compressed isn't listed"));
+    b = b.limitations(src.limitations());
     Ok(ToolOutput::evidence(b.build()?))
 }
 
@@ -530,21 +532,22 @@ fn native_strings_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, T
     let p: SearchParams = parse_params(params)?;
     select_document(ctx, &p.document)?;
     let m = Matcher::new(&p.pattern, p.mode, p.case_sensitive)?;
-    let st = native(ctx)?;
+    let src = strings_source(ctx)?;
     let mut rows = Vec::new();
-    for (i, s) in st.prog.strings.iter().enumerate() {
+    for (i, s) in src.strings().iter().enumerate() {
         if i % 4096 == 0 {
             ctx.cancel.check()?;
         }
         if m.is_match(&s.text) {
-            let users: Vec<Value> = st
-                .prog
-                .xrefs_to
-                .get(&s.addr)
-                .map(|v| {
-                    v.iter().take(32).map(|x| json!({"from": hex(x.from), "function": st.prog.function_containing(x.from).map(|f| f.name.clone())})).collect()
-                })
-                .unwrap_or_default();
+            // Unknown (null), not none, when the code couldn't be read.
+            let users: Option<Vec<Value>> = src.program().map(|prog| {
+                prog.xrefs_to
+                    .get(&s.addr)
+                    .map(|v| {
+                        v.iter().take(32).map(|x| json!({"from": hex(x.from), "function": prog.function_containing(x.from).map(|f| f.name.clone())})).collect()
+                    })
+                    .unwrap_or_default()
+            });
             rows.push(json!({"address": hex(s.addr), "text": s.text, "section": s.section, "references": users}));
         }
     }
@@ -554,6 +557,7 @@ fn native_strings_find(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, T
         .summary(format!("{} strings match \"{}\".", rows.len(), p.pattern))
         .coverage(cov)
         .limitation(Limitation::new("data_sections_only", "only strings stored in the file are searched (absence is not proof)"))
+        .limitations(src.limitations())
         .build()?;
     Ok(ToolOutput::evidence(e))
 }
@@ -723,6 +727,34 @@ mod tests {
         assert_eq!(r["result"]["documents"].as_array().unwrap().len(), 1);
         assert!(call_err(&e, "native_functions_list", json!({"bogus": 1})).message.contains("unknown field"));
         assert!(call_err(&e, "native_functions_list", json!({"document": "nope"})).remediation.is_some());
+    }
+
+    #[test]
+    fn strings_are_found_in_a_program_whose_code_the_built_in_engine_cant_decode() {
+        // The same program, marked as MIPS (a PSP module's processor): its text is still there to
+        // find, but which code uses it isn't known, and the result says so rather than "none".
+        let (mut elf, _) = tk::elf64(tk::ElfArch::X86_64, true);
+        elf[18..20].copy_from_slice(&8u16.to_le_bytes());
+        let e = engine_with("prog", &elf);
+        assert_eq!(call_err(&e, "native_functions_list", json!({})).code, craft_anything_evidence::ErrorCode::NotSupported);
+        let r = call(&e, "native_strings_find", json!({"pattern": "CRAFT"}));
+        assert_eq!(r["result"]["total"], 1, "{r}");
+        assert!(r["result"]["matches"][0]["references"].is_null(), "{r}");
+        let unknown = |r: &serde_json::Value| {
+            r["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "references_unknown" && l["message"].as_str().unwrap().contains("mips"))
+        };
+        assert!(unknown(&r), "{r}");
+        let r = call(&e, "native_strings_browse", json!({}));
+        let strings = r["result"]["strings"].as_array().unwrap();
+        assert!(strings.iter().any(|s| s["text"] == tk::HELLO), "{r}");
+        assert!(strings.iter().all(|s| s["references"].is_null()), "{r}");
+        assert!(unknown(&r), "{r}");
+        // A program the engine decodes still counts its references.
+        let (elf, _) = tk::elf64(tk::ElfArch::X86_64, true);
+        let e = engine_with("prog", &elf);
+        let r = call(&e, "native_strings_find", json!({"pattern": "CRAFT"}));
+        assert!(r["result"]["matches"][0]["references"].is_array(), "{r}");
+        assert!(!unknown(&r), "{r}");
     }
 
     #[test]

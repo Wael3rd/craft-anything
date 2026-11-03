@@ -19,7 +19,9 @@ pub mod sbpf;
 
 pub use decode::{ArmConsts, Cond, Flow, Insn, Kind, MemOp, Mode, Op, canonical_reg, decode};
 pub use image::Image;
-pub use program::{Block, CallSite, Callee, Function, JumpTable, Limits, ProgString, Program, SlotInfo, Stats, Term, Xref, XrefKind, slot_label};
+pub use program::{
+    Block, CallSite, Callee, Function, JumpTable, Limits, ProgString, Program, SlotInfo, Stats, Term, Xref, XrefKind, image_strings, slot_label,
+};
 
 /// Why the native engine stopped.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

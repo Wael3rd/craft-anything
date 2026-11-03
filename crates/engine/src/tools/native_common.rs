@@ -6,8 +6,8 @@ use crate::session::{OpenTarget, Session};
 use crate::target::{Target, TargetKind};
 use crate::tool::{CancelToken, Ctx, Progress, ProgressFn, ToolOutput};
 use craft_anything_analysis::native::Report;
-use craft_anything_disasm::{Control, DisasmError, Function, Image, Limits, Program};
-use craft_anything_evidence::{Coverage, ErrorCode, EvidenceBuilder, ToolError};
+use craft_anything_disasm::{Control, DisasmError, Function, Image, Limits, ProgString, Program, image_strings};
+use craft_anything_evidence::{Coverage, ErrorCode, EvidenceBuilder, Limitation, ToolError};
 use craft_anything_formats::Arch;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -124,6 +124,76 @@ pub fn native(ctx: &mut Ctx<'_>) -> Result<Arc<NativeState>, ToolError> {
     let state = Arc::new(NativeState { img, prog });
     ctx.session.active_mut()?.ext.insert(state.clone());
     Ok(state)
+}
+
+/// The strings of a program whose code the built-in engine can't decode, cached on the target:
+/// finding text needs no decoding, only which code uses it does.
+pub struct UndecodedStrings {
+    pub strings: Vec<ProgString>,
+    /// The processor, as the file names it (`mips`).
+    pub arch: String,
+    /// The string cap was reached.
+    pub capped: bool,
+}
+
+/// Where the string tools read: the whole analysis, or only the strings when the code is in a
+/// processor the built-in engine doesn't decode.
+pub enum StringSource {
+    Analysed(Arc<NativeState>),
+    Undecoded(Arc<UndecodedStrings>),
+}
+
+impl StringSource {
+    pub fn strings(&self) -> &[ProgString] {
+        match self {
+            StringSource::Analysed(st) => &st.prog.strings,
+            StringSource::Undecoded(u) => &u.strings,
+        }
+    }
+
+    /// The analysis, when there is one (references come from it).
+    pub fn program(&self) -> Option<&Program> {
+        match self {
+            StringSource::Analysed(st) => Some(&st.prog),
+            StringSource::Undecoded(_) => None,
+        }
+    }
+
+    /// What the strings can't say about this program, for the evidence.
+    pub fn limitations(&self) -> Vec<Limitation> {
+        match self {
+            StringSource::Analysed(_) => Vec::new(),
+            StringSource::Undecoded(u) => {
+                let mut l = vec![Limitation::new(
+                    "references_unknown",
+                    format!("the built-in engine can't decode {} code, so which code uses each string isn't known", u.arch),
+                )];
+                if u.capped {
+                    l.push(Limitation::new("strings_capped", format!("kept the first {} strings", u.strings.len())));
+                }
+                l
+            }
+        }
+    }
+}
+
+/// The active target's strings: from the analysis when the built-in engine decodes its code,
+/// else straight from the file's data, so a program in a processor only Ghidra reads (a MIPS
+/// PSP module, SH-4 Dreamcast code) can still be searched for text.
+pub fn strings_source(ctx: &mut Ctx<'_>) -> Result<StringSource, ToolError> {
+    let img = image(ctx)?.0.clone();
+    if img.mode.is_some() {
+        return native(ctx).map(StringSource::Analysed);
+    }
+    if let Some(u) = ctx.session.active()?.ext.get::<UndecodedStrings>() {
+        return Ok(StringSource::Undecoded(u));
+    }
+    let limits = Limits::default();
+    let strings = image_strings(&img, &limits);
+    let capped = strings.len() >= limits.max_strings;
+    let u = Arc::new(UndecodedStrings { strings, arch: img.bin.arch_name.clone(), capped });
+    ctx.session.active_mut()?.ext.insert(u.clone());
+    Ok(StringSource::Undecoded(u))
 }
 
 /// User names first, then the engine's.

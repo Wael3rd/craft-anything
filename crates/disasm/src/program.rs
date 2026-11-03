@@ -690,6 +690,13 @@ fn split_at_references(strings: Vec<ProgString>, xrefs: &[Xref]) -> Vec<ProgStri
     out
 }
 
+/// The strings stored in an image's data, found without analysing its code: a program in a
+/// processor the decoder doesn't read (`img.mode` is `None`) still has text to search. Nothing is
+/// known about which code uses them. At most `limits.max_strings`.
+pub fn image_strings(img: &Image, limits: &Limits) -> Vec<ProgString> {
+    collect_strings(img, limits)
+}
+
 fn collect_strings(img: &Image, limits: &Limits) -> Vec<ProgString> {
     let bin = &img.bin;
     let mut out = Vec::new();

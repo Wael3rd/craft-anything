@@ -483,8 +483,9 @@ Owner: open · Status: in progress
       loaded into Ghidra where it runs (`-loader BinaryLoader -loader-baseAddr`, part of the cache key)
 - [x] `native_functions_decompile` asks Ghidra in Deep mode, item by item, as
       `native_function_pseudocode` does (it used the built-in lifter only)
-- [ ] String tools (`native_strings_find`, `native_strings_browse`) refuse a program the built-in
-      decoder can't read (a MIPS PSP module), though finding strings needs no decoding
+- [x] String tools (`native_strings_find`, `native_strings_browse`) read a program the built-in
+      decoder can't (a MIPS PSP module) straight from its data, with references `null` (unknown,
+      not none) and a `references_unknown` limitation
 - [ ] Triage says a PSP module (`.prx`, MIPS ELF of type 0xFFA0) is "a program for Linux, built for
       other"; its imports by library (`.sceStub.text.*`) aren't read as imports
 - [ ] Disc images: triage doesn't recognise an ISO 9660 image, a `.cue` or its `.bin` tracks
