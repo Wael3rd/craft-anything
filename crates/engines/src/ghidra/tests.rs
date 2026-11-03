@@ -268,9 +268,16 @@ fn analysis_runs_once_with_the_language_pin_then_the_bridge_opens_it_read_only()
     let bi = raw.iter().position(|a| a == "-loader-baseAddr").expect("gives the load address");
     assert_eq!(raw.get(bi + 1).map(String::as_str), Some("0x8c010000"));
     assert!(li > raw.iter().position(|a| a == "-processor").unwrap(), "{raw:?}");
+    // It starts there too, which nothing in the file says: the pre-script is told, as its argument.
+    let pre = raw.iter().position(|a| a == "-preScript").expect("runs the pre-script");
+    assert_eq!(raw.get(pre + 1).map(String::as_str), Some(FAST_SCRIPT_NAME));
+    assert_eq!(raw.get(pre + 2).map(String::as_str), Some("entry=0x8c010000"), "{raw:?}");
+    assert_eq!(raw.last().map(String::as_str), Some("entry=0x8c010000"), "nothing after it is read as a flag");
+    // A file with headers says where it starts: no entry is handed over.
+    assert!(!auto.iter().chain(&pinned).any(|a| a.starts_with("entry=")), "{auto:?} {pinned:?}");
     // Without a language the raw loader can't read anything, so it isn't asked for.
     let unpinned = strs(analyse_args(pd, snap, log, Path::new("/scripts"), None, None, Some(0x8c01_0000)));
-    assert!(!unpinned.iter().any(|a| a.starts_with("-loader")), "{unpinned:?}");
+    assert!(!unpinned.iter().any(|a| a.starts_with("-loader") || a.starts_with("entry=")), "{unpinned:?}");
 
     // Later sessions open the saved program without analysing again, and run our bridge.
     let open = strs(bridge_args(pd, "target-abc", log, Path::new("/s.log"), Path::new("/scripts"), Path::new("/session.json")));

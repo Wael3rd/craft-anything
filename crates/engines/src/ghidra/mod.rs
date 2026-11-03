@@ -168,7 +168,9 @@ const ANALYSED_MARKER: &str = "analysed.ok";
 /// it in the cached project (no bridge yet), with the optional processor/compiler-spec pin. A
 /// `-cspec` is only emitted alongside a `-processor`, matching Ghidra's requirement, and so is
 /// the raw loader with its base address (`load_base`, for raw machine code), since Ghidra's raw
-/// loader needs a language. Pure, so it can be unit-tested without a Ghidra install.
+/// loader needs a language. Raw code also starts there, which nothing in the file tells Ghidra:
+/// our pre-script is handed `entry=<base>` and marks it, so the analysis has somewhere to begin.
+/// Pure, so it can be unit-tested without a Ghidra install.
 pub(crate) fn analyse_args(
     project_dir: &Path,
     snapshot: &Path,
@@ -180,6 +182,7 @@ pub(crate) fn analyse_args(
 ) -> Vec<OsString> {
     let mut a: Vec<OsString> =
         vec![project_dir.as_os_str().to_owned(), OsString::from(PROJECT_NAME), OsString::from("-import"), snapshot.as_os_str().to_owned()];
+    let mut raw_entry = None;
     if let Some(lang) = language_id.map(str::trim).filter(|s| !s.is_empty()) {
         a.push(OsString::from("-processor"));
         a.push(OsString::from(lang));
@@ -189,11 +192,16 @@ pub(crate) fn analyse_args(
         }
         if let Some(base) = load_base {
             a.extend([OsString::from("-loader"), OsString::from("BinaryLoader"), OsString::from("-loader-baseAddr"), OsString::from(format!("{base:#x}"))]);
+            raw_entry = Some(base);
         }
     }
     for (flag, v) in [("-log", log.as_os_str()), ("-scriptPath", script_dir.as_os_str()), ("-preScript", std::ffi::OsStr::new(FAST_SCRIPT_NAME))] {
         a.push(OsString::from(flag));
         a.push(v.to_owned());
+    }
+    // The pre-script's arguments follow its name.
+    if let Some(entry) = raw_entry {
+        a.push(OsString::from(format!("entry={entry:#x}")));
     }
     a
 }

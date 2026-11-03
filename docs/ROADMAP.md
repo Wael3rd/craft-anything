@@ -493,8 +493,14 @@ Owner: open · Status: in progress
 - [ ] The managed Java doesn't start from a deep folder (its `jvm.dll` path past ~250 characters):
       Ghidra's launcher then blames `JAVA_HOME`, and our error points at an analysis log that was
       never written
-- [ ] Ghidra's raw loader is given no entry point, so a raw program has no functions until one is
-      asked for (each is made on demand)
+- [x] Ghidra's analysis of raw code starts at its entry point: our pre-script is handed
+      `entry=<load address>`, marks it and makes a function there, so the analysis follows what it
+      calls (a raw program used to have no functions until one was asked for, each made on demand)
+- [ ] Raw code that jumps through pointers kept in memory (a Dreamcast start jumps to its C runtime
+      through a literal-pool word) stops Ghidra's analysis at the entry: the raw loader makes all
+      memory writable, so those words aren't constants to follow, and later functions are still
+      made on demand. Making all memory read-only would fold real variables into constants;
+      marking only the pool words read-only might not
 - [ ] `deep::prepare` (the builder's analysis ahead of time) builds its cache key without a target's
       own `language_id` or raw load address, so for raw code (or a target opened with its own
       language) it analyses separately, loading the code at 0, and the builder's tools never reuse

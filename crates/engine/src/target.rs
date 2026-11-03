@@ -142,7 +142,8 @@ pub struct Target {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RawSpec {
-    /// `x86`, `x86_64`, `arm`, `arm64`.
+    /// `x86`, `x86_64`, `arm`, `arm64` for the built-in engine; any other processor's name (`sh4`)
+    /// with a Ghidra `language_id`, read in Deep mode.
     pub architecture: String,
     /// Load and entry address.
     pub entry_point: u64,

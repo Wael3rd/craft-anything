@@ -18,13 +18,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// The analysis settings hash for the default Deep profile. Part of the project cache key, so a
-/// different pinned language, or raw code loaded somewhere else, re-analyses rather than reusing
-/// another project. (Without a load address the seed is what it always was, so existing analyses
-/// are still found.)
+/// different pinned language, or raw code loaded (and started) somewhere else, re-analyses rather
+/// than reusing another project. (Without a load address the seed is what it always was, so
+/// existing analyses are still found.)
 fn settings_hash(language_id: Option<&str>, load_base: Option<u64>) -> String {
     let mut seed = format!("craft-anything-ghidra-fast-profile-v2|lang={}", language_id.unwrap_or(""));
     if let Some(base) = load_base {
-        seed.push_str(&format!("|base={base:#x}"));
+        // Analysed from its entry point, which an analysis made before that was known didn't have.
+        seed.push_str(&format!("|raw-start={base:#x}"));
     }
     craft_anything_evidence::sha256_hex(seed.as_bytes())
 }
