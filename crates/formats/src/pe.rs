@@ -550,7 +550,7 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
             let name = i.name.clone().unwrap_or_else(|| format!("{}#{}", i.library.trim_end_matches(".dll").trim_end_matches(".DLL"), i.ordinal.unwrap_or(0)));
             libs.insert(i.library.clone());
             b.import_slots.push(ImportSlot { addr: i.slot_va, name: name.clone(), library: Some(i.library.clone()), kind: "slot" });
-            b.imports.push(Import { name, library: Some(i.library.clone()), ordinal: i.ordinal, slot: Some(i.slot_va) });
+            b.imports.push(Import { name, library: Some(i.library.clone()), ordinal: i.ordinal, nid: None, slot: Some(i.slot_va) });
         }
         b.libraries = libs.into_iter().collect();
     }
@@ -565,7 +565,7 @@ pub fn enrich(data: &[u8], b: &mut Binary) {
         if let Some(slot) = i.slot_va {
             b.import_slots.push(ImportSlot { addr: slot, name: name.clone(), library: Some(i.library.clone()), kind: "slot" });
         }
-        b.imports.push(Import { name, library: Some(i.library), ordinal: i.ordinal, slot: i.slot_va });
+        b.imports.push(Import { name, library: Some(i.library), ordinal: i.ordinal, nid: None, slot: i.slot_va });
     }
     // Mitigations.
     let dc = h.dll_characteristics;

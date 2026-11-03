@@ -27,7 +27,7 @@ pub fn mode_for(bin: &Binary) -> Option<Mode> {
                 Some(Mode::A32)
             }
         }
-        Arch::Other => None,
+        Arch::Mips | Arch::Other => None,
     }
 }
 

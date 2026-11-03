@@ -51,6 +51,8 @@ pub enum Arch {
     X86_64,
     Arm,
     Aarch64,
+    /// 32-bit MIPS (the PlayStation Portable's processor, among others).
+    Mips,
     Other,
 }
 
@@ -62,6 +64,7 @@ impl Arch {
             Arch::X86_64 => "x86_64",
             Arch::Arm => "arm",
             Arch::Aarch64 => "arm64",
+            Arch::Mips => "mips",
             Arch::Other => "other",
         }
     }
@@ -73,6 +76,7 @@ impl Arch {
             "x86_64" | "x86-64" | "amd64" | "x64" => Some(Arch::X86_64),
             "arm" | "armv7" | "arm32" | "thumb" => Some(Arch::Arm),
             "arm64" | "aarch64" | "arm64e" => Some(Arch::Aarch64),
+            "mips" | "mips32" => Some(Arch::Mips),
             _ => None,
         }
     }
@@ -80,7 +84,7 @@ impl Arch {
     pub fn pointer_size(self) -> u64 {
         match self {
             Arch::X86_16 => 2,
-            Arch::X86 | Arch::Arm => 4,
+            Arch::X86 | Arch::Arm | Arch::Mips => 4,
             Arch::X86_64 | Arch::Aarch64 | Arch::Other => 8,
         }
     }
@@ -167,6 +171,9 @@ pub struct Import {
     pub library: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ordinal: Option<u16>,
+    /// The 32-bit name hash a PlayStation Portable module imports by (it has no names).
+    #[serde(with = "crate::hex_nid::opt", skip_serializing_if = "Option::is_none")]
+    pub nid: Option<u32>,
     /// The pointer slot the loader fills (GOT/IAT entry), when known.
     #[serde(with = "hex_addr::opt", skip_serializing_if = "Option::is_none")]
     pub slot: Option<u64>,
@@ -177,6 +184,12 @@ pub struct Export {
     pub name: String,
     #[serde(with = "hex_addr")]
     pub addr: u64,
+    /// The library an export belongs to, when the container groups them (PlayStation Portable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library: Option<String>,
+    /// The 32-bit name hash a PlayStation Portable module exports by.
+    #[serde(with = "crate::hex_nid::opt", skip_serializing_if = "Option::is_none")]
+    pub nid: Option<u32>,
 }
 
 /// A pointer slot (or a stub) that resolves to an imported function at run time.
@@ -272,7 +285,7 @@ impl Binary {
     pub fn raw(arch: Arch, base: u64, len: u64, file_offset: u64) -> Binary {
         let bits = match arch {
             Arch::X86_16 => 16,
-            Arch::X86 | Arch::Arm => 32,
+            Arch::X86 | Arch::Arm | Arch::Mips => 32,
             _ => 64,
         };
         Binary {
@@ -313,6 +326,15 @@ impl Binary {
             info: BTreeMap::new(),
             details: serde_json::Value::Null,
             warnings: Vec::new(),
+        }
+    }
+
+    /// The container's name for people: a PlayStation Portable module is an ELF, but not a Linux one.
+    pub fn format_plain(&self) -> &'static str {
+        if self.format == Format::Elf && self.info.get("platform").map(String::as_str) == Some("psp") {
+            "ELF (PlayStation Portable module)"
+        } else {
+            self.format.plain()
         }
     }
 
@@ -502,6 +524,7 @@ fn arch_of(a: object::Architecture) -> (Arch, String) {
         A::X86_64 | A::X86_64_X32 => Arch::X86_64,
         A::Arm => Arch::Arm,
         A::Aarch64 | A::Aarch64_Ilp32 => Arch::Aarch64,
+        A::Mips => Arch::Mips,
         _ => Arch::Other,
     };
     (arch, format!("{a:?}").to_ascii_lowercase())
@@ -618,6 +641,7 @@ fn parse_object(data: &[u8], slice_offset: u64) -> Result<Binary, FormatError> {
                     name: String::from_utf8_lossy(imp.name()).into_owned(),
                     library: if lib.is_empty() { None } else { Some(lib) },
                     ordinal: None,
+                    nid: None,
                     slot: None,
                 });
             }
@@ -627,7 +651,7 @@ fn parse_object(data: &[u8], slice_offset: u64) -> Result<Binary, FormatError> {
     match file.exports() {
         Ok(list) => {
             for ex in list.into_iter().take(MAX_IMPORTS) {
-                b.exports.push(Export { name: String::from_utf8_lossy(ex.name()).into_owned(), addr: ex.address() });
+                b.exports.push(Export { name: String::from_utf8_lossy(ex.name()).into_owned(), addr: ex.address(), library: None, nid: None });
             }
         }
         Err(e) => b.warnings.push(format!("exports: {e}")),
@@ -661,7 +685,9 @@ fn parse_object(data: &[u8], slice_offset: u64) -> Result<Binary, FormatError> {
     }
     let slots: Vec<Option<u64>> = b.imports.iter().map(|i| slot_of.get(i.name.as_str()).copied()).collect();
     for (imp, slot) in b.imports.iter_mut().zip(slots) {
-        imp.slot = slot;
+        if slot.is_some() {
+            imp.slot = slot;
+        }
     }
     let canary_names = ["__stack_chk_fail", "___stack_chk_fail", "__security_check_cookie", "__stack_chk_guard", "___stack_chk_guard"];
     let has = |n: &str| b.imports.iter().any(|i| i.name == n) || b.symbols.iter().any(|s| s.name == n);

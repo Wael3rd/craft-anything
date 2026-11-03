@@ -295,12 +295,17 @@ pub fn enrich(data: &[u8], file: &object::File<'_>, b: &mut Binary) {
     }
     let _ = file.architecture();
     b.details = json!({
-        "elf_type": match e_type { 1 => "REL", 2 => "EXEC", 3 => "DYN", 4 => "CORE", _ => "OTHER" },
+        "elf_type": match e_type { 1 => "REL", 2 => "EXEC", 3 => "DYN", 4 => "CORE", 0xFFA0 => "PRX", _ => "OTHER" },
         "program_headers": phdrs,
         "dynamic": dyn_json,
         "dt_flags": format!("{flags:#x}"),
         "dt_flags_1": format!("{flags1:#x}"),
     });
+    if crate::psp::is_psp_module(e.u16(18).unwrap_or(0), e_type, b) {
+        // The first program header's p_paddr points at the module info.
+        let hint = e.u32(28).and_then(|phoff| usize::try_from(phoff).ok()).and_then(|o| o.checked_add(12)).and_then(|o| e.u32(o)).map(u64::from);
+        crate::psp::enrich(data, b, e_type, hint);
+    }
     // With no section headers `object` finds no symbols; the dynamic section still points at them.
     if b.sections.is_empty()
         && let Some(ds) = dynamic_symbols(data, b)
@@ -335,9 +340,9 @@ fn add_dynamic_symbols(b: &mut Binary, ds: DynamicSymbols) {
             dynamic: true,
         });
     }
-    b.exports.extend(ds.exports.iter().take(MAX_IMPORTS).map(|s| Export { name: s.name.clone(), addr: s.addr }));
+    b.exports.extend(ds.exports.iter().take(MAX_IMPORTS).map(|s| Export { name: s.name.clone(), addr: s.addr, library: None, nid: None }));
     let room = MAX_IMPORTS.saturating_sub(b.imports.len());
-    b.imports.extend(ds.imports.into_iter().take(room).map(|s| Import { name: s.name, library: s.library, ordinal: None, slot: None }));
+    b.imports.extend(ds.imports.into_iter().take(room).map(|s| Import { name: s.name, library: s.library, ordinal: None, nid: None, slot: None }));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -890,6 +895,7 @@ pub fn parse_core(data: &[u8]) -> Result<CoreDump, FormatError> {
         62 => Arch::X86_64,
         3 => Arch::X86,
         183 => Arch::Aarch64,
+        8 if !e.is64 => Arch::Mips,
         40 => Arch::Arm,
         _ => Arch::Other,
     };

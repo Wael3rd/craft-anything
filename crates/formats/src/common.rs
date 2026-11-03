@@ -100,3 +100,17 @@ mod tests {
         assert_eq!(find_bytes(b"abc", b"", 10), None);
     }
 }
+
+/// Serialise a PlayStation Portable name hash (NID) as `0x` and eight upper-case hex digits.
+pub mod hex_nid {
+    pub mod opt {
+        use serde::Serializer;
+
+        pub fn serialize<S: Serializer>(v: &Option<u32>, s: S) -> Result<S::Ok, S::Error> {
+            match v {
+                Some(v) => s.serialize_str(&format!("{v:#010X}").replacen("0X", "0x", 1)),
+                None => s.serialize_none(),
+            }
+        }
+    }
+}

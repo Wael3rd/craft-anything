@@ -485,8 +485,18 @@ Owner: open · Status: in progress
       `native_function_pseudocode` does (it used the built-in lifter only)
 - [ ] String tools (`native_strings_find`, `native_strings_browse`) refuse a program the built-in
       decoder can't read (a MIPS PSP module), though finding strings needs no decoding
-- [ ] Triage says a PSP module (`.prx`, MIPS ELF of type 0xFFA0) is "a program for Linux, built for
-      other"; its imports by library (`.sceStub.text.*`) aren't read as imports
+- [x] A PSP module (`.prx`, MIPS ELF of type 0xFFA0, or a PSP executable) is named for what it is:
+      triage says "PlayStation Portable module" with its module name and version, operating system
+      "PSP" and architecture `mips` (the architecture enum now has `Mips`, so no MIPS file reads
+      "other"); `crates/formats/src/psp.rs` reads the module info, the import stubs by library and
+      the export entries into `imports` (`<Library>_<NID>`, with a typed `nid` and the stub as the
+      slot), `exports`, `libraries` and `details.psp_module`; corrupt tables give warnings
+- [ ] PSP imports and exports have no names, only NIDs: a name table (built by us, from names we
+      hash ourselves, not copied from another project) would let `<Library>_<NID>` read as a function
+      name; variable imports keep their NIDs in `details.psp_module` but have no stub address
+- [ ] Triage doesn't recognise `PARAM.SFO` (PSF: a NUL byte then `PSF`, key and data tables: TITLE, DISC_ID,
+      CATEGORY, PSP_SYSTEM_VER) or an encrypted PSP executable (`~PSP` header, `EBOOT.BIN`/`.PRX`: it
+      must be decrypted first, and triage should say so)
 - [ ] Disc images: triage doesn't recognise an ISO 9660 image, a `.cue` or its `.bin` tracks
       (`core_archive_show` calls a PSP ISO "text"); `firmware_regions_list` finds the ISO 9660, but
       nothing extracts its files

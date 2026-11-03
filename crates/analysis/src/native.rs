@@ -53,7 +53,9 @@ fn program_limitations(prog: &Program) -> Vec<Limitation> {
 /// A plain-English description of what a native binary is, plus where to go next.
 pub fn triage(bin: &Binary, data: &[u8], file_name: &str) -> Report {
     let hints = detect(bin, data);
+    let psp = bin.format == Format::Elf && bin.info.get("platform").map(String::as_str) == Some("psp");
     let os = match bin.format {
+        Format::Elf if psp => "PSP",
         Format::Elf => {
             if bin.libraries.iter().any(|l| l.contains("liblog.so") || l.contains("libandroid")) {
                 "Android"
@@ -87,7 +89,32 @@ pub fn triage(bin: &Binary, data: &[u8], file_name: &str) -> Report {
         Some("anycpu-prefer-32") => "any CPU, preferring 32-bit".to_string(),
         _ => format!("{} ({}-bit)", bin.arch.name(), bin.bits),
     };
-    let mut plain = format!("{file_name} is {what} for {os}, built for {built_for}.");
+    let mut plain = if psp {
+        let named = match (bin.info.get("module_name"), bin.info.get("module_version")) {
+            (Some(n), Some(v)) => format!(" named {n:?} (version {v})"),
+            (Some(n), None) => format!(" named {n:?}"),
+            _ => String::new(),
+        };
+        let endian = if bin.little_endian { "little-endian" } else { "big-endian" };
+        format!("{file_name} is a PlayStation Portable (PSP) module{named}, built for {} ({}-bit, {endian}).", bin.arch.name(), bin.bits)
+    } else {
+        format!("{file_name} is {what} for {os}, built for {built_for}.")
+    };
+    if psp {
+        if bin.imports.is_empty() {
+            plain.push_str(" No imports were found in its library tables.");
+        } else {
+            plain.push_str(&format!(
+                " It imports {} functions from {} system libraries and exports {} entries; the file holds only name hashes (NIDs), not function names.",
+                bin.imports.len(),
+                bin.libraries.len(),
+                bin.exports.len()
+            ));
+        }
+        if bin.mitigations.stripped {
+            plain.push_str(" It has no symbol table, so most functions will have generated names.");
+        }
+    }
     if let Some(l) = lang.first() {
         plain.push_str(&format!(" It looks like it was made with {}.", l.label));
     }
@@ -106,7 +133,7 @@ pub fn triage(bin: &Binary, data: &[u8], file_name: &str) -> Report {
         None
     };
     let stripped = bin.mitigations.stripped && bin.format != Format::Raw && names_kept_in.is_none();
-    if stripped {
+    if stripped && !psp {
         plain.push_str(" Its internal names were removed (stripped), so most functions will have generated names.");
     } else if let (true, Some(source)) = (bin.mitigations.stripped, names_kept_in) {
         plain.push_str(&format!(" It has no native symbol table, but its function names are kept in {source}."));
@@ -161,10 +188,11 @@ pub fn triage(bin: &Binary, data: &[u8], file_name: &str) -> Report {
     toolsets.dedup();
     let mut seen = BTreeSet::new();
     let next: Vec<Value> = tools.into_iter().filter(|(t, _)| seen.insert(*t)).map(|(t, why)| json!({"tool": t, "why": why})).collect();
+    let psp_module = bin.details.get("psp_module").cloned().unwrap_or(Value::Null);
     let result = json!({
         "plain_english": plain,
         "format": bin.format,
-        "format_name": bin.format.plain(),
+        "format_name": bin.format_plain(),
         "operating_system": os,
         "kind": bin.kind,
         "architecture": bin.arch.name(),
@@ -173,13 +201,22 @@ pub fn triage(bin: &Binary, data: &[u8], file_name: &str) -> Report {
         "entry_point": bin.entry.map(hex),
         "stripped": stripped,
         "symbol_table_stripped": bin.mitigations.stripped,
-        "libraries": bin.libraries.iter().take(32).collect::<Vec<_>>(),
+        "libraries": bin.libraries.iter().take(64).collect::<Vec<_>>(),
+        "import_count": bin.imports.len(),
+        "export_count": bin.exports.len(),
+        "psp_module": psp_module,
         "toolchain_hints": hints,
         "recommended_toolsets": toolsets,
         "next_steps": next,
     });
     let mut r = Report::new(result, plain, if hints.iter().any(|h| h.strength == "weak") { Confidence::Inferred } else { Confidence::Observed });
     r.limitations.push(Limitation::new("heuristic_hints", "toolchain and packer hints come from markers that can be faked or borrowed"));
+    if psp {
+        r.limitations.push(Limitation::new(
+            "nid_only",
+            "a PSP module imports by 32-bit name hashes (NIDs); imports are shown as <library>_<NID> because the file carries no function names",
+        ));
+    }
     if let Some(e) = bin.entry {
         r.locations.push(Location::address(e).with_label("entry point"));
     }
@@ -230,7 +267,7 @@ pub fn overview(img: &Image, prog: &Program, file_name: &str) -> Report {
     });
     let summary = format!(
         "{} {} for {} with {} functions, {} strings, {} imports from {} libraries.",
-        bin.format.plain(),
+        bin.format_plain(),
         bin.kind,
         bin.arch.name(),
         prog.functions.len(),
@@ -1134,6 +1171,23 @@ mod tests {
         let t = triage(&net, &elf, "n");
         assert!(!t.summary.contains("(stripped)"), "{}", t.summary);
         assert!(t.summary.contains(".NET metadata"), "{}", t.summary);
+    }
+
+    #[test]
+    fn triage_names_a_psp_module_for_what_it_is() {
+        let data = tk::psp::psp_prx(tk::psp::Fault::None);
+        let bin = craft_anything_formats::parse_binary(&data).unwrap();
+        let t = triage(&bin, &data, "game.prx");
+        assert!(t.summary.contains("PlayStation Portable"), "{}", t.summary);
+        assert!(t.summary.contains("TestModule") && t.summary.contains("mips"), "{}", t.summary);
+        assert!(!t.summary.contains("Linux") && !t.summary.contains("other"), "{}", t.summary);
+        assert_eq!(t.result["operating_system"], "PSP");
+        assert_eq!(t.result["architecture"], "mips");
+        assert_eq!(t.result["libraries"][0], "ThreadManForUser");
+        assert_eq!(t.result["import_count"], 2);
+        assert_eq!(t.result["export_count"], 2);
+        assert_eq!(t.result["psp_module"]["module_info"]["name"], "TestModule");
+        assert!(t.limitations.iter().any(|l| l.code == "nid_only"));
     }
 
     #[test]

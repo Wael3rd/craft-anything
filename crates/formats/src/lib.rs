@@ -47,6 +47,7 @@ pub mod pe;
 pub mod pixels;
 pub mod pkcs7;
 pub mod plist;
+pub mod psp;
 pub mod pyc;
 pub mod pyinstaller;
 pub mod rust_bin;
@@ -69,7 +70,7 @@ pub mod zip;
 
 // Native executable formats (ELF, PE, Mach-O, DOS) and their shared helpers.
 pub use binary::{Arch, Binary, Export, Format, Import, ImportSlot, Mitigations, Relocation, Section, Segment, Symbol, SymbolKind, parse_binary};
-pub use common::{FormatError, entropy, find_bytes, hex_addr};
+pub use common::{FormatError, entropy, find_bytes, hex_addr, hex_nid};
 
 use bytes::Reader;
 

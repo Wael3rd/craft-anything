@@ -326,7 +326,7 @@ fn native_layout_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     let m = &bin.mitigations;
     let summary = format!(
         "{} {} ({}): {} sections, {} symbols, {} relocations; NX {}, PIE {}, RELRO {}, canary {}.",
-        bin.format.plain(),
+        bin.format_plain(),
         bin.kind,
         bin.arch.name(),
         bin.sections.len(),
