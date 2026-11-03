@@ -367,6 +367,39 @@ fn read_entries(data: &[u8], b: &mut Binary, range: Option<(u64, u64)>) -> Vec<E
     out
 }
 
+/// The first four bytes of a PSP executable the console decrypts at load time (`~PSP`).
+pub const ENCRYPTED_MAGIC: [u8; 4] = *b"~PSP";
+/// Where the module name sits in that header: 28 bytes, NUL padded.
+const ENCRYPTED_NAME_AT: usize = 0x0A;
+const ENCRYPTED_NAME_LEN: usize = 28;
+/// Fewest bytes a file needs for the name field to be whole.
+const ENCRYPTED_HEADER_LEN: usize = ENCRYPTED_NAME_AT + ENCRYPTED_NAME_LEN;
+
+/// What the header of an encrypted PSP executable (`EBOOT.BIN`, `.PRX`) says in the clear.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EncryptedHeader {
+    /// The module's name, as the header carries it.
+    pub module_name: String,
+    /// Size of the whole file.
+    pub file_size: u64,
+}
+
+/// True when the bytes start with the `~PSP` magic.
+pub fn is_encrypted(data: &[u8]) -> bool {
+    data.starts_with(&ENCRYPTED_MAGIC)
+}
+
+/// Read the clear part of a `~PSP` header. `None` when the file isn't one or is shorter than a header.
+pub fn parse_encrypted_header(data: &[u8]) -> Option<EncryptedHeader> {
+    if !is_encrypted(data) || data.len() < ENCRYPTED_HEADER_LEN {
+        return None;
+    }
+    let name = data.get(ENCRYPTED_NAME_AT..ENCRYPTED_NAME_AT.checked_add(ENCRYPTED_NAME_LEN)?)?;
+    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    let module_name = clean(name.get(..end)?);
+    Some(EncryptedHeader { module_name, file_size: data.len() as u64 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,5 +547,22 @@ mod module_tests {
                 let _ = parse_binary(&g);
             }
         }
+    }
+
+    #[test]
+    fn encrypted_header_names_the_module_and_survives_truncation() {
+        let mut data = vec![0u8; 0x100];
+        data[..4].copy_from_slice(b"~PSP");
+        data[0x0A..0x0A + 11].copy_from_slice(b"PSP_Example");
+        let h = parse_encrypted_header(&data).unwrap();
+        assert_eq!(h.module_name, "PSP_Example");
+        assert_eq!(h.file_size, 0x100);
+        for n in 0..data.len() {
+            let _ = parse_encrypted_header(&data[..n]);
+        }
+        assert!(parse_encrypted_header(&data[..0x20]).is_none());
+        data[0x0A..0x0A + 28].fill(0xff);
+        assert!(parse_encrypted_header(&data).unwrap().module_name.chars().all(|c| c == '?'));
+        assert!(parse_encrypted_header(b"\x7fELF").is_none() && !is_encrypted(b"~PS"));
     }
 }

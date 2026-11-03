@@ -1746,6 +1746,8 @@ pub fn kind_icon(k: TargetKind) -> &'static str {
         TargetKind::Plist => "list-tree",
         TargetKind::Evm => "zap",
         TargetKind::Sqlite => "database",
+        TargetKind::PspParamSfo => "list-tree",
+        TargetKind::PspEncrypted => "lock",
         TargetKind::Unknown => "file",
     }
 }

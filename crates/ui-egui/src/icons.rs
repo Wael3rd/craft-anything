@@ -116,6 +116,8 @@ mod tests {
             K::Plist,
             K::Evm,
             K::Sqlite,
+            K::PspParamSfo,
+            K::PspEncrypted,
             K::DosCom,
             K::RawBinary,
             K::Unknown,

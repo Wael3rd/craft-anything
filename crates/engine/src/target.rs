@@ -40,6 +40,10 @@ pub enum TargetKind {
     Evm,
     /// A SQLite 3 database file.
     Sqlite,
+    /// A PSP `PARAM.SFO` (PSF key/value tables).
+    PspParamSfo,
+    /// A PSP executable still encrypted (`~PSP` header): it has to be decrypted before its code can be read.
+    PspEncrypted,
     /// A DOS .COM program.
     DosCom,
     /// Raw bytes with a user-declared architecture (firmware, shellcode).
@@ -68,6 +72,8 @@ impl TargetKind {
             TargetKind::Plist => "An Apple settings file (plist)",
             TargetKind::Evm => "A smart contract (EVM bytecode)",
             TargetKind::Sqlite => "A SQLite database (how an app stores its data)",
+            TargetKind::PspParamSfo => "A PlayStation Portable game description (PARAM.SFO)",
+            TargetKind::PspEncrypted => "An encrypted PlayStation Portable program",
             TargetKind::DosCom => "A DOS program",
             TargetKind::RawBinary => "Raw machine code",
             TargetKind::Unknown => "A file we don't recognise yet",
@@ -83,7 +89,11 @@ impl TargetKind {
 pub fn sniff(bytes: &[u8], name: &str) -> TargetKind {
     let lower = name.to_ascii_lowercase();
     let starts = |m: &[u8]| bytes.starts_with(m);
-    if starts(b"SQLite format 3\0") {
+    if craft_anything_formats::psf::is_psf(bytes) {
+        TargetKind::PspParamSfo
+    } else if craft_anything_formats::psp::is_encrypted(bytes) {
+        TargetKind::PspEncrypted
+    } else if starts(b"SQLite format 3\0") {
         TargetKind::Sqlite
     } else if starts(b"\x7fELF") {
         TargetKind::Elf
@@ -208,6 +218,8 @@ mod tests {
         assert_eq!(sniff(b"PK\x03\x04", "app.apk"), TargetKind::Apk);
         assert_eq!(sniff(b"bplist00", "Info.plist"), TargetKind::Plist);
         assert_eq!(sniff(b"SQLite format 3\0\x10\x00", "app.db"), TargetKind::Sqlite);
+        assert_eq!(sniff(b"\x00PSF\x01\x01\x00\x00", "PARAM.SFO"), TargetKind::PspParamSfo);
+        assert_eq!(sniff(b"~PSP\x00\x00\x00\x00", "EBOOT.BIN"), TargetKind::PspEncrypted);
         assert_eq!(sniff(b"", "x"), TargetKind::Unknown);
         assert_eq!(sniff(b"console.log(1)", "main.js"), TargetKind::Script);
     }

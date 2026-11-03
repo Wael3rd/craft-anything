@@ -128,6 +128,8 @@ pub fn suggestions(kind: Option<TargetKind>) -> Vec<&'static str> {
         Some(NetworkCapture) => vec!["Which servers were contacted?", "What data was sent?"],
         Some(Plist) => vec!["What settings are in here?"],
         Some(Evm) => vec!["What does this contract do?", "Who can move funds?"],
+        Some(PspParamSfo) => vec!["Which game is this?", "What firmware does it need?"],
+        Some(PspEncrypted) => vec!["Why can't I read this program?", "How do I get at its code?"],
         Some(Unknown) => vec!["What kind of file is this?", "Is there any readable text inside?"],
     }
 }

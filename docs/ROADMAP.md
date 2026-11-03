@@ -495,9 +495,15 @@ Owner: open · Status: in progress
       hash ourselves, not copied from another project) would let `<Library>_<NID>` read as a function
       name; imported variables are only counted (`details.psp_module`): where their NIDs are kept
       isn't read yet
-- [ ] Triage doesn't recognise `PARAM.SFO` (PSF: a NUL byte then `PSF`, key and data tables: TITLE, DISC_ID,
-      CATEGORY, PSP_SYSTEM_VER) or an encrypted PSP executable (`~PSP` header, `EBOOT.BIN`/`.PRX`: it
-      must be decrypted first, and triage should say so)
+- [x] Triage recognises `PARAM.SFO` (new target kind `psp-param-sfo`, `formats::psf`: title, disc id, category,
+      firmware, every entry as a field, warnings for bad offsets) and an encrypted PSP executable (`~PSP`,
+      kind `psp-encrypted`: module name from the header, says it must be decrypted first; native tools give
+      that reason)
+- [ ] Nothing decrypts a `~PSP` executable, so `EBOOT.BIN` and `.PRX` files in a game's `SYSDIR` have no
+      code to read until they are decrypted elsewhere; the `PSAR` update archive (`DATA.BIN`, magic
+      `PSAR`) isn't recognised either
+- [ ] `PARAM.SFO` is read only when it's the target itself: the game folder and ISO inventories
+      (`core_archive_show`) don't show its title or disc id yet
 - [ ] Disc images: triage doesn't recognise an ISO 9660 image, a `.cue` or its `.bin` tracks
       (`core_archive_show` calls a PSP ISO "text"); `firmware_regions_list` finds the ISO 9660, but
       nothing extracts its files

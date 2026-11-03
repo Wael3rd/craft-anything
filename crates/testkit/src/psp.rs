@@ -170,3 +170,49 @@ pub fn psp_prx(fault: Fault) -> Vec<u8> {
     p32(&mut f, ph + 28, 0x40);
     f
 }
+
+/// A synthetic `PARAM.SFO`: the PSF header, the index, the keys and the data. A value is text
+/// (`Ok`) or a number (`Err`). The title and ids are invented.
+pub fn param_sfo(entries: &[(&str, Result<&str, u32>)]) -> Vec<u8> {
+    let (mut keys, mut data, mut index) = (Vec::new(), Vec::new(), Vec::new());
+    for (key, value) in entries {
+        index.extend_from_slice(&(keys.len() as u16).to_le_bytes());
+        keys.extend_from_slice(key.as_bytes());
+        keys.push(0);
+        let (format, bytes, max) = match value {
+            Ok(s) => (0x0204u16, [s.as_bytes(), &[0]].concat(), 64usize),
+            Err(n) => (0x0404u16, n.to_le_bytes().to_vec(), 4),
+        };
+        index.extend_from_slice(&format.to_le_bytes());
+        index.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        index.extend_from_slice(&(max as u32).to_le_bytes());
+        index.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        data.extend_from_slice(&bytes);
+        data.resize(data.len() + max.saturating_sub(bytes.len()), 0);
+    }
+    let key_start = 20 + index.len();
+    let data_start = key_start + keys.len();
+    let mut out = vec![0, b'P', b'S', b'F'];
+    out.extend_from_slice(&0x0101u32.to_le_bytes());
+    out.extend_from_slice(&(key_start as u32).to_le_bytes());
+    out.extend_from_slice(&(data_start as u32).to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    out.extend(index);
+    out.extend(keys);
+    out.extend(data);
+    out
+}
+
+/// A synthetic encrypted PSP executable: the `~PSP` magic, the module name in the clear, then
+/// bytes that stand in for the encrypted rest.
+pub fn encrypted_eboot(module_name: &str) -> Vec<u8> {
+    let mut out = vec![0u8; 0x200];
+    out[..4].copy_from_slice(b"~PSP");
+    for (slot, byte) in out[0x0A..0x26].iter_mut().zip(module_name.bytes()) {
+        *slot = byte;
+    }
+    for (i, byte) in out[0x80..].iter_mut().enumerate() {
+        *byte = (i as u8).wrapping_mul(31).wrapping_add(7);
+    }
+    out
+}

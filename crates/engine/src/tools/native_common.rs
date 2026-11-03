@@ -57,6 +57,13 @@ pub fn disasm_err(e: DisasmError) -> ToolError {
     }
 }
 
+/// Why an encrypted PSP program (a `~PSP` header) can't be read as code.
+pub fn encrypted_psp_error() -> ToolError {
+    ToolError::unsupported("This PlayStation Portable program is encrypted (it starts with a ~PSP header), so its code can't be read yet.").with_remediation(
+        "Decrypt it first with a tool that can (this app doesn't decrypt it), then open the decrypted file; core_target_triage shows its module name.",
+    )
+}
+
 /// Build an image for a target of any native kind.
 pub fn image_for(t: &Target) -> Result<Image, ToolError> {
     match t.kind {
@@ -78,6 +85,7 @@ pub fn image_for(t: &Target) -> Result<Image, ToolError> {
                 }
             }
         }
+        TargetKind::PspEncrypted => Err(encrypted_psp_error()),
         other => Err(ToolError::unsupported(format!("{} is not native machine code.", other.plain()))
             .with_remediation("Run triage to see which tools fit this kind of file.")),
     }

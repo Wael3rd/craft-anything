@@ -47,6 +47,7 @@ pub mod pe;
 pub mod pixels;
 pub mod pkcs7;
 pub mod plist;
+pub mod psf;
 pub mod psp;
 pub mod pyc;
 pub mod pyinstaller;

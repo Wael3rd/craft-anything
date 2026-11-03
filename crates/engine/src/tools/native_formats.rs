@@ -297,6 +297,9 @@ fn native_pe_resources_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutp
 fn native_layout_show(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: LayoutParams = parse_params(params)?;
     let (data, subject) = input(ctx, &p.path, 2 << 30)?;
+    if craft_anything_formats::psp::is_encrypted(&data) {
+        return Err(super::native_common::encrypted_psp_error());
+    }
     let bin = craft_anything_formats::parse_binary(&data).map_err(|e| ToolError::unsupported(format!("Not a readable ELF, PE or Mach-O file: {e}")))?;
     const CAP: usize = 20_000;
     let syms: Vec<Value> = bin.symbols.iter().take(CAP).map(|s| json!({"name": s.name, "demangled": s.demangled, "address": hex(s.addr), "size": s.size, "kind": s.kind, "global": s.global, "weak": s.weak, "defined": s.defined, "dynamic": s.dynamic})).collect();
@@ -521,6 +524,16 @@ fn non_native_triage(t: &Target) -> (String, Vec<&'static str>, Vec<(&'static st
             (format!("{n} is a recording of network traffic."), vec!["core", "browser"], vec![("web_recording_show", "list requests and APIs")])
         }
         TargetKind::Plist => (format!("{n} is an Apple settings file (property list)."), vec!["core", "apple"], vec![("apple_plist_show", "read it as JSON")]),
+        TargetKind::PspParamSfo => (
+            format!("{n} is a PlayStation Portable game description (PARAM.SFO)."),
+            vec!["core"],
+            vec![("native_bytes_show", "look at the raw bytes"), ("core_archive_show", "inventory the game folder it sits in")],
+        ),
+        TargetKind::PspEncrypted => (
+            format!("{n} is an encrypted PlayStation Portable program (a ~PSP header): it has to be decrypted before its code can be read."),
+            vec!["core"],
+            vec![("native_bytes_show", "look at the raw bytes")],
+        ),
         TargetKind::Evm => (format!("{n} is smart-contract bytecode."), vec!["core", "formats"], vec![("formats_evm_interface_show", "function selectors")]),
         TargetKind::Sqlite => {
             (format!("{n} is a SQLite database (how an app stores its data)."), vec!["core", "database"], vec![("db_sqlite_show", "tables, schema and rows")])
@@ -584,6 +597,42 @@ fn core_target_triage(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
                 toolsets = vec!["core", "formats"];
                 tools = vec![("game_archives_list", "find the archives it packs its files in"), ("game_pak_list", "list what's in an Unreal pak")];
             }
+            // A PSP game description or an encrypted PSP program: say what it holds, or why it can't be read yet.
+            let mut psp_result: Option<Value> = None;
+            let mut psp_confidence = Confidence::Inferred;
+            match t.kind {
+                TargetKind::PspParamSfo => match craft_anything_formats::psf::Psf::parse(&t.bytes) {
+                    Ok(psf) => {
+                        plain = psf.plain();
+                        psp_confidence = Confidence::Observed;
+                        for w in &psf.warnings {
+                            builder = builder.limitation(Limitation::new("psf_warning", w.clone()));
+                        }
+                        psp_result = Some(json!({"psf_version": psf.version, "fields": psf.fields(), "declared_entries": psf.declared_entries}));
+                    }
+                    Err(e) => builder = builder.limitation(Limitation::new("native_parse_failed", e.to_string())),
+                },
+                TargetKind::PspEncrypted => {
+                    psp_confidence = Confidence::Observed;
+                    let header = craft_anything_formats::psp::parse_encrypted_header(&t.bytes);
+                    plain = match &header {
+                        Some(h) => format!(
+                            "{} is an encrypted PlayStation Portable program (module \"{}\"): it has to be decrypted before its code can be read.",
+                            t.name, h.module_name
+                        ),
+                        None => format!(
+                            "{} is an encrypted PlayStation Portable program (a ~PSP header): it has to be decrypted before its code can be read.",
+                            t.name
+                        ),
+                    };
+                    builder = builder.limitation(Limitation::new(
+                        "encrypted_executable",
+                        "the code is encrypted: decrypt the program with a tool that can (this app does not), then open the result",
+                    ));
+                    psp_result = Some(json!({"encrypted": true, "header": header}));
+                }
+                _ => {}
+            }
             let mut result = json!({
                 "plain_english": plain,
                 "kind": t.kind,
@@ -595,10 +644,13 @@ fn core_target_triage(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
             if let Some((g, _)) = game {
                 result["game"] = json!(g);
             }
+            if let Some(extra) = psp_result {
+                result["psp"] = extra;
+            }
             builder
                 .result(result)
                 .summary(plain)
-                .confidence(Confidence::Inferred)
+                .confidence(psp_confidence)
                 .limitation(Limitation::new("detected_by_content", "the kind is detected from the first bytes and, to break ties, the file name"))
                 .build()?
         }
@@ -819,6 +871,39 @@ mod tests {
         assert_eq!(r["result"]["kind"], "unknown");
         assert!(r["summary"].as_str().unwrap().contains("isn't a format we recognise yet"));
         assert!(!r["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "native_parse_failed"));
+    }
+
+    #[test]
+    fn triage_reads_a_psp_param_sfo() {
+        let data = tk::psp::param_sfo(&[("CATEGORY", Ok("UG")), ("DISC_ID", Ok("ULES00000")), ("PSP_SYSTEM_VER", Ok("3.40")), ("TITLE", Ok("TEST GAME"))]);
+        let e = engine_with("PARAM.SFO", &data);
+        let r = call(&e, "core_target_triage", json!({}));
+        assert_eq!(r["result"]["kind"], "psp-param-sfo");
+        let plain = r["result"]["plain_english"].as_str().unwrap();
+        assert!(plain.contains("\"TEST GAME\"") && plain.contains("ULES00000") && plain.contains("3.40"), "{plain}");
+        assert_eq!(r["result"]["psp"]["fields"]["TITLE"], "TEST GAME");
+        // Cut short in the middle of the tables: still a PARAM.SFO, with a warning, never a failure.
+        let cut = engine_with("PARAM.SFO", &data[..data.len() - 100]);
+        let r = call(&cut, "core_target_triage", json!({}));
+        assert_eq!(r["result"]["kind"], "psp-param-sfo");
+        assert!(r["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "psf_warning"));
+    }
+
+    #[test]
+    fn triage_says_an_encrypted_psp_program_must_be_decrypted() {
+        let data = tk::psp::encrypted_eboot("PSP_Example");
+        let e = engine_with("EBOOT.BIN", &data);
+        let r = call(&e, "core_target_triage", json!({}));
+        assert_eq!(r["result"]["kind"], "psp-encrypted");
+        let plain = r["result"]["plain_english"].as_str().unwrap();
+        assert!(plain.contains("PSP_Example") && plain.contains("decrypted"), "{plain}");
+        assert_eq!(r["result"]["psp"]["header"]["module_name"], "PSP_Example");
+        assert!(r["limitations"].as_array().unwrap().iter().any(|l| l["code"] == "encrypted_executable"));
+        let error = call_err(&e, "native_layout_show", json!({}));
+        assert!(error.message.contains("encrypted"), "{}", error.message);
+        let short = engine_with("EBOOT.BIN", &data[..8]);
+        let r = call(&short, "core_target_triage", json!({}));
+        assert!(r["result"]["plain_english"].as_str().unwrap().contains("encrypted"));
     }
 
     #[test]
