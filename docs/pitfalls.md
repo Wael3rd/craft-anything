@@ -503,7 +503,7 @@ and read `git status` before `git add -A`.
 folder (a person's project) and `D:evil.bat` onto drive D; `NUL` or `com1.txt` name devices. Only
 a component that is one `Component::Normal` with no `:`, no control character, no trailing dot or
 space and no device name is safe: build paths from names read out of a file with
-`artifact_tools::join_under`, never `PathBuf::join` alone.
+`craft_anything_platform::fs::join_under`, never `PathBuf::join` alone.
 
 **A cooked guess that matched a raw disc.** The firmware scan looked for an ISO 9660 volume as
 `CD001` at +0x8001; a raw 2352-byte track holds the same bytes 16 bytes into sector 16, so the cooked

@@ -514,9 +514,9 @@ Owner: open · Status: in progress
       INDEX times and the GD-ROM area start), then check on a real disc
 - [ ] Disc images: tracks sharing one `.bin` with different sector sizes (2048 and 2352) get their
       start from their own sector size only; no such sheet was tried
-- [ ] Engine installers (`engines/src/install.rs`, pinned vendor downloads) have their own
-      `safe_components`, which still accepts a `:` inside a name (`C:x`) and device names; give it the
-      same rule as `artifact_tools::unsafe_component`
+- [x] Engine installers (`engines/src/install.rs`, pinned vendor downloads) use the same name rule as
+      extraction: `safe_components`, `unsafe_component` and `join_under` moved to
+      `craft_anything_platform::fs`, so `C:x` and device names are refused when unpacking an engine too
 - [ ] Disc images: `core_target_open` still reads a whole image into memory (2 GiB cap), so triage of a
       larger `.bin` is refused; open it by path with the disc tools instead (they stream)
 - [x] Disc images: the Joliet (UCS-2) name path is tested on a synthetic image with both trees (long

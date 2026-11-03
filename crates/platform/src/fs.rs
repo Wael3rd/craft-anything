@@ -92,9 +92,108 @@ pub fn backup_once(from: &Path, to: &Path) -> Result<bool, ToolError> {
     Ok(true)
 }
 
+/// Turn a name read out of a file (an archive member, a disc's file) into safe relative components,
+/// or explain why not. Every component passes [`unsafe_component`] on every system, so a name that
+/// is harmless on Linux but escapes or misbehaves on Windows (`C:x`, `NUL`) is refused everywhere.
+pub fn safe_components(name: &str) -> Result<Vec<String>, &'static str> {
+    if name.contains('\0') {
+        return Err("name contains a NUL byte");
+    }
+    let norm = name.replace('\\', "/");
+    if norm.starts_with('/') {
+        return Err("absolute path");
+    }
+    let mut out = Vec::new();
+    for c in norm.split('/') {
+        match c {
+            "" | "." => {}
+            c => match unsafe_component(c) {
+                Some(why) => return Err(why),
+                None => out.push(c.to_string()),
+            },
+        }
+    }
+    if out.is_empty() {
+        return Err("empty name");
+    }
+    Ok(out)
+}
+
+/// Why `c` can't be one plain file or folder name on every system we run on, or None when it can.
+/// On Windows `root.join("C:x")` is not under `root` (it means "x in drive C's current folder") and
+/// `NUL`, `com1.txt` or a name ending in a dot or space name devices or other files.
+pub fn unsafe_component(c: &str) -> Option<&'static str> {
+    if c.is_empty() {
+        return Some("empty name");
+    }
+    if c == "." || c == ".." {
+        return Some("path climbs out of the folder (..)");
+    }
+    if c.contains(['/', '\\']) {
+        return Some("name contains a path separator");
+    }
+    if c.contains(':') {
+        return Some("name contains ':' (on Windows a drive or a stream, which would leave the folder)");
+    }
+    if c.chars().any(char::is_control) {
+        return Some("name contains a control character");
+    }
+    if c.ends_with(['.', ' ']) {
+        return Some("name ends in a dot or a space (Windows drops them, so it would name another file)");
+    }
+    if windows_device(c) {
+        return Some("a Windows device name (CON, PRN, AUX, NUL, COM1…, LPT1…)");
+    }
+    None
+}
+
+/// True for names Windows takes as a device whatever the folder: CON, PRN, AUX, NUL, COM0-9, LPT0-9
+/// (and their superscript forms), CONIN$ and CONOUT$, in any case, with any extension.
+fn windows_device(c: &str) -> bool {
+    let stem = c.split('.').next().unwrap_or(c).trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+        return true;
+    }
+    stem.strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+        .is_some_and(|n| (n.len() == 1 && n.bytes().all(|b| b.is_ascii_digit())) || matches!(n, "¹" | "²" | "³"))
+}
+
+/// `root` with `comps` appended, when each is one plain name ([`unsafe_component`]) and the result
+/// is still under `root`; None otherwise. Every path built from names read out of a file goes
+/// through this before it is written or read.
+pub fn join_under(root: &Path, comps: &[String]) -> Option<std::path::PathBuf> {
+    let mut path = root.to_path_buf();
+    for c in comps {
+        if unsafe_component(c).is_some() {
+            return None;
+        }
+        let mut parts = Path::new(c).components();
+        match (parts.next(), parts.next()) {
+            (Some(std::path::Component::Normal(n)), None) if n == std::ffi::OsStr::new(c) => path.push(n),
+            _ => return None,
+        }
+    }
+    path.starts_with(root).then_some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_that_would_leave_the_folder_or_name_a_device_are_refused() {
+        for bad in ["../x", "/x", "a\\..\\..\\x", "C:\\x", "C:x", "D:evil.bat", "x:y/z", "NUL", "nul.txt", "COM1", "lpt9.log", "a. ", "x\u{1}"] {
+            assert!(safe_components(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(safe_components("./a//b").unwrap(), vec!["a", "b"]);
+        assert!(safe_components("").is_err());
+        let root = Path::new("out");
+        assert_eq!(join_under(root, &["a".into(), "b.txt".into()]), Some(root.join("a").join("b.txt")));
+        for bad in ["C:x", "..", "a/b", "CON"] {
+            assert!(join_under(root, &[bad.to_string()]).is_none(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn atomic_write_replaces_and_private_is_0600() {

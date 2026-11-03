@@ -11,7 +11,7 @@
 //!   cancelled install never leaves a half-written engine behind.
 
 use craft_anything_evidence::{ErrorCode, ToolError};
-use craft_anything_platform::fs::write_atomic;
+use craft_anything_platform::fs::{join_under, safe_components, write_atomic};
 use craft_anything_platform::process::Cancel;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -321,12 +321,8 @@ fn member_path(dest: &Path, name: &str, strip_prefix: Option<&str>) -> Option<Pa
         Some(p) => name.strip_prefix(p)?,
         None => name,
     };
-    let rel = safe_components(name).ok().filter(|r| !r.is_empty())?;
-    let mut path = dest.to_path_buf();
-    for c in &rel {
-        path.push(c);
-    }
-    Some(path)
+    let rel = safe_components(name).ok()?;
+    join_under(dest, &rel)
 }
 
 fn write_member(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
@@ -406,28 +402,6 @@ fn unpack_tar(data: &[u8], dest: &Path, strip_prefix: Option<&str>, cancel: Opti
         return Err(ToolError::new(ErrorCode::GarbledOutput, "The archive contained no usable files."));
     }
     Ok(written)
-}
-
-/// Turn an archive member name into safe relative components (no `..`, absolute or drive-letter
-/// paths, no NUL).
-fn safe_components(name: &str) -> Result<Vec<String>, &'static str> {
-    if name.contains('\0') {
-        return Err("name contains a NUL byte");
-    }
-    let norm = name.replace('\\', "/");
-    if norm.starts_with('/') {
-        return Err("absolute path");
-    }
-    let mut out = Vec::new();
-    for c in norm.split('/') {
-        match c {
-            "" | "." => {}
-            ".." => return Err("path climbs out of the folder"),
-            c if c.len() == 2 && c.ends_with(':') => return Err("drive-letter path"),
-            c => out.push(c.to_string()),
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(unix)]
@@ -548,11 +522,15 @@ mod tests {
     const TAR_XZ: &str = "fd377a585a000004e6d6b4460200210116000000742fe5a3e027ff00b95d00381ac91598acd1b234b7cf2f9dad0e287d129d13e5581d0f65aacbc6993ed65c623bb34f1cec998f414b193ae8d64e266bd6a04145e33d28c8b0f03106162354da1e0244e42f3bfa05dce43926c9b28039e5719c8a26e70d04b2ed7073f11a50f3f0e4679408db9327796c40719e04310e15eb36b3663fe42e616563e2ffbe3ccca4ceda11b6140a97d1412818e287480942a93c90ef60056a8a2f34f413d850e4add9e54f0541ac9ac93abcafdaaabdb075c3e49ce4a1f60000000000f2d8b968b3c5292a0001d501805000007ae8233db1c467fb020000000004595a";
 
     #[test]
-    fn safe_components_rejects_traversal() {
-        assert!(safe_components("../etc/passwd").is_err());
-        assert!(safe_components("/abs").is_err());
-        assert!(safe_components("a/b/c").unwrap().len() == 3);
-        assert!(safe_components("./a").unwrap() == vec!["a".to_string()]);
+    fn member_paths_never_leave_the_install_folder() {
+        let dest = Path::new("store").join("jadx");
+        assert_eq!(member_path(&dest, "jadx-1.5/bin/jadx", Some("jadx-1.5/")), Some(dest.join("bin").join("jadx")));
+        assert_eq!(member_path(&dest, "./a", None), Some(dest.join("a")));
+        // Escapes, including the Windows ones a plain `..` check misses (`C:x` replaces the root).
+        for bad in ["../etc/passwd", "/abs", "C:x/y", "D:evil.bat", "bin/NUL", "x/con.txt", "a./b", ""] {
+            assert_eq!(member_path(&dest, bad, None), None, "{bad:?}");
+        }
+        assert_eq!(member_path(&dest, "other-top/x", Some("jadx-1.5/")), None, "outside the expected folder");
     }
 
     /// Downloads the real pins for this computer (about 80 MB). Run with `--ignored`.
