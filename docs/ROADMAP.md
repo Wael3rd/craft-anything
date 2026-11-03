@@ -495,9 +495,28 @@ Owner: open · Status: in progress
       finds raw-sector volumes); `core_archive_show`/`core_archive_extract` now say a disc isn't an
       archive and point at the disc tools. Checked live on a PSP ISO (1529 files) and a Dreamcast cue
       (1ST_READ.BIN SHA-256 matches)
-- [ ] Disc images: Rock Ridge names, multi-extent files and Mode 2 Form 2 (2324-byte) sectors aren't read;
-      PS1/PS2 `.bin`/`.cue` discs and UDF-only discs weren't tried; `.cue` tracks in other sector sizes
-      (2336) aren't detected
+- [x] Disc images, hostile input (found by review): names that leave the output folder on Windows
+      (`C:x`, `D:evil.bat`) or name devices (`NUL`, `com1.txt`), or end in a dot or space, are refused
+      by `safe_components` (shared with archive and firmware extraction) and every path is joined
+      through `join_under`, also for `.asar.unpacked` reads; the directory walk keeps one directory
+      in memory at a time, caps a path at 4096 bytes, all paths at 32 MiB and all directory bytes read
+      at 64 MiB, and stops when the call is cancelled; extraction writes an extent once and at most
+      twice the image's size by default; Mode 2 Form 2 and CD-audio files (CD-XA attributes) are
+      flagged, not read as data; a cue track starts at its INDEX 01 in a shared `.bin`; files past the
+      end of a Dreamcast track 3 are reported as in the last data track and the listing is incomplete;
+      FIFOs are never opened
+- [ ] Disc images: Rock Ridge names and multi-extent files aren't read; Mode 2 Form 2 (2324-byte)
+      and CD-audio files are flagged but not taken out; PS1/PS2 `.bin`/`.cue` discs and UDF-only discs
+      weren't tried; `.cue` tracks in other sector sizes (2336) aren't detected
+- [ ] Disc images: a file system that spans several tracks (a Dreamcast disc with CD audio: track 3
+      and the last data track) is read from one track's file only; files in the later track are
+      named and skipped. Read across the cue's tracks (each file's first block from the sheet's
+      INDEX times and the GD-ROM area start), then check on a real disc
+- [ ] Disc images: tracks sharing one `.bin` with different sector sizes (2048 and 2352) get their
+      start from their own sector size only; no such sheet was tried
+- [ ] Engine installers (`engines/src/install.rs`, pinned vendor downloads) have their own
+      `safe_components`, which still accepts a `:` inside a name (`C:x`) and device names; give it the
+      same rule as `artifact_tools::unsafe_component`
 - [ ] Disc images: `core_target_open` still reads a whole image into memory (2 GiB cap), so triage of a
       larger `.bin` is refused; open it by path with the disc tools instead (they stream)
 - [ ] Disc images: the Joliet (UCS-2) name path has no test (no synthetic or real Joliet disc was tried)

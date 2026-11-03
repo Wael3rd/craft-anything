@@ -257,13 +257,12 @@ pub(crate) fn load_app_input(ctx: &Ctx<'_>, p: &AnalyzeParams) -> Result<(AppInp
                     continue;
                 }
                 if e.unpacked {
-                    if let Ok(comps) = super::artifact_tools::safe_components(&e.path) {
-                        let src = comps.iter().fold(unpacked_root.clone(), |acc, c| acc.join(c));
-                        if std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file())
-                            && let Ok(b) = std::fs::read(&src)
-                        {
-                            input.files.push(AppFile { path: e.path.clone(), bytes: b });
-                        }
+                    if let Ok(comps) = super::artifact_tools::safe_components(&e.path)
+                        && let Some(src) = super::artifact_tools::join_under(&unpacked_root, &comps)
+                        && std::fs::symlink_metadata(&src).is_ok_and(|m| m.is_file())
+                        && let Ok(b) = std::fs::read(&src)
+                    {
+                        input.files.push(AppFile { path: e.path.clone(), bytes: b });
                     }
                     continue;
                 }

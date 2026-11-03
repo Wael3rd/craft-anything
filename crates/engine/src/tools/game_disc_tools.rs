@@ -3,10 +3,10 @@
 //! never into memory, so a disc of several gigabytes is fine: only the descriptors and directories
 //! are read to list it, and each file is streamed to disk when extracted.
 
-use super::artifact_tools::{UnlessWritten, abs_path, create_absent_dir, safe_components};
+use super::artifact_tools::{UnlessWritten, abs_path, create_absent_dir, join_under, safe_components};
 use super::native_common::{params_json, spec};
 use super::static_input::builder;
-use crate::tool::{Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
+use crate::tool::{CancelToken, Ctx, Effects, Requires, ToolOutput, ToolSpec, Toolset, parse_params, schema_of};
 use craft_anything_evidence::{Confidence, Coverage, CoverageStatus, ErrorCode, Limitation, Location, Subject, ToolError};
 use craft_anything_formats::cue::{self, CueSheet, CueTrack};
 use craft_anything_formats::fsread::Limits;
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -41,7 +42,7 @@ pub fn specs() -> Vec<ToolSpec> {
         spec(
             "game_disc_files_extract",
             "Take a game disc's files out",
-            "Extract the files of a game disc image (see game_disc_files_list for what is read) into a new folder (output_directory must not exist yet), keeping its folders, streaming each file to disk so large discs are fine. Optionally only a folder of the disc (prefix). Bounded by max_files and max_bytes; never overwrites; names that would leave the folder are refused. Returns each file's SHA-256 and what was skipped and why (a file that runs past the end of a cut-short image, a name clash, a limit).",
+            "Extract the files of a game disc image (see game_disc_files_list for what is read) into a new folder (output_directory must not exist yet), keeping its folders, streaming each file to disk so large discs are fine. Optionally only a folder of the disc (prefix). Bounded by max_files and max_bytes (by default twice the image's size); never overwrites; names that would leave the folder or that Windows reserves (C:x, NUL, COM1…) are refused, and a file whose data was already written under another name is written once. Returns each file's SHA-256 and what was skipped and why (a file that runs past the end of a cut-short image or lies in another track, a Mode 2 Form 2 stream or CD audio, a name clash, a limit).",
             "Copy the files off a game disc image into a folder so you can look at them.",
             Toolset::Formats,
             Effects::MUTATES_SESSION.union(Effects::WRITES_FILESYSTEM),
@@ -61,8 +62,10 @@ fn d_limit() -> usize {
 fn d_files() -> usize {
     100_000
 }
-fn d_bytes() -> u64 {
-    8 << 30
+/// What a real disc's files can add up to at most, when max_bytes isn't given: overlapping
+/// extents could otherwise turn a small image into gigabytes of output.
+fn default_max_bytes(image_bytes: u64) -> u64 {
+    image_bytes.saturating_mul(2).max(1 << 20)
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
@@ -102,15 +105,21 @@ pub struct DiscExtractParams {
     /// Most files written (1..=1000000, default 100000).
     #[serde(default = "d_files")]
     pub max_files: usize,
-    /// Most bytes written in total (default 8 GiB).
-    #[serde(default = "d_bytes")]
-    pub max_bytes: u64,
+    /// Most bytes written in total (1..=68719476736; default: twice the image's size, more than a
+    /// real disc's files add up to).
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
 }
 
-/// A file opened for random reads. Used from one thread at a time.
+/// A file (or the part of it one track takes) opened for random reads. Used from one thread at a time.
 struct FileSource {
     file: RefCell<File>,
+    /// Where the track starts in the file.
+    start: u64,
+    /// Bytes from `start` that belong to it.
     len: u64,
+    /// Stops a directory walk when the tool call is cancelled.
+    cancel: Option<CancelToken>,
 }
 
 impl Source for FileSource {
@@ -118,8 +127,13 @@ impl Source for FileSource {
         self.len
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> bool {
+        let end = offset.checked_add(buf.len() as u64);
+        let Some(at) = self.start.checked_add(offset).filter(|_| end.is_some_and(|e| e <= self.len)) else { return false };
         let Ok(mut f) = self.file.try_borrow_mut() else { return false };
-        f.seek(SeekFrom::Start(offset)).is_ok() && f.read_exact(buf).is_ok()
+        f.seek(SeekFrom::Start(at)).is_ok() && f.read_exact(buf).is_ok()
+    }
+    fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
     }
 }
 
@@ -129,21 +143,62 @@ struct Disc {
     image: PathBuf,
     name: String,
     source: FileSource,
+    /// The disc block the track starts at, when the sheet tells (see `Volume::open_numbered`).
+    first_block: Option<u32>,
     /// The cue track it came from, when the path was a cue sheet.
     track: Option<CueTrack>,
     /// The sheet's tracks that also hold a volume and weren't chosen.
     others: Vec<Value>,
     /// Tracks the sheet lists, with whether each could be found.
     sheet: Option<Value>,
+    /// Data tracks after the chosen one, in other files: where files past the end of this one are.
+    later_data: Vec<CueTrack>,
 }
 
-fn open_file(path: &Path) -> Result<FileSource, ToolError> {
+impl Disc {
+    fn volume(&self) -> Result<Volume<'_, FileSource>, ToolError> {
+        Volume::open_numbered(&self.source, self.first_block).map_err(|why| ToolError::unsupported(format!("{}: {why}", self.name)))
+    }
+
+    /// Why a file past the end of this track's file is missing: it is probably in a later data track.
+    fn elsewhere(&self) -> Option<String> {
+        let t = self.later_data.last()?;
+        Some(format!(
+            "probably in track {} ({}): the disc's file system spans several tracks (as on a Dreamcast disc with CD audio), and reading across tracks isn't supported yet",
+            t.number, t.file
+        ))
+    }
+}
+
+fn open_file(path: &Path, cancel: &CancelToken) -> Result<FileSource, ToolError> {
     let meta = std::fs::metadata(path).map_err(|e| ToolError::io(path.display(), e))?;
     if !meta.is_file() {
         return Err(ToolError::invalid(format!("{} is not a file", path.display())));
     }
     let file = File::open(path).map_err(|e| ToolError::io(path.display(), e))?;
-    Ok(FileSource { file: RefCell::new(file), len: meta.len() })
+    Ok(FileSource { file: RefCell::new(file), start: 0, len: meta.len(), cancel: Some(cancel.clone()) })
+}
+
+/// Bytes per sector of a track in its file (2352 unless the sheet says otherwise).
+fn sector_bytes(t: &CueTrack) -> u64 {
+    u64::from(t.sector_size.filter(|s| *s > 0).unwrap_or(2352))
+}
+
+/// Where track `i` lies in its file: from its INDEX 01 (or first index) to the first index of the
+/// next track in the same file, or the file's end. Several tracks can share one `.bin`.
+fn track_span(tracks: &[CueTrack], i: usize, file_len: u64) -> (u64, u64) {
+    let Some(t) = tracks.get(i) else { return (0, file_len) };
+    let frames = |t: &CueTrack| t.indexes.iter().filter_map(|x| x.frames).min();
+    let start_frames = t.indexes.iter().find(|x| x.number == 1).and_then(|x| x.frames).or_else(|| frames(t)).unwrap_or(0);
+    let start = start_frames.saturating_mul(sector_bytes(t)).min(file_len);
+    let end = tracks
+        .iter()
+        .skip(i.saturating_add(1))
+        .find(|n| n.file == t.file)
+        .and_then(|n| frames(n)?.checked_mul(sector_bytes(n)))
+        .unwrap_or(file_len)
+        .clamp(start, file_len);
+    (start, end)
 }
 
 /// A path in a cue sheet, joined to the sheet's folder; names that climb out of it or are absolute are refused.
@@ -155,7 +210,16 @@ fn beside(sheet: &Path, name: &str) -> Option<PathBuf> {
     Some(sheet.parent()?.join(rel))
 }
 
+/// True for a regular file. Checked before opening anything a person names: opening a FIFO (or a
+/// device) for reading can wait forever for a writer.
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file())
+}
+
 fn is_cue(path: &Path) -> bool {
+    if !is_regular_file(path) {
+        return false;
+    }
     if path.extension().is_some_and(|x| x.eq_ignore_ascii_case("cue")) {
         return true;
     }
@@ -165,13 +229,16 @@ fn is_cue(path: &Path) -> bool {
 }
 
 fn read_cue(path: &Path) -> Result<CueSheet, ToolError> {
+    if !is_regular_file(path) {
+        return Err(ToolError::invalid(format!("{} is not a file", path.display())));
+    }
     let mut text = Vec::new();
     File::open(path).and_then(|f| f.take(cue::MAX_BYTES as u64).read_to_end(&mut text)).map_err(|e| ToolError::io(path.display(), e))?;
     Ok(cue::parse(&String::from_utf8_lossy(&text)))
 }
 
-fn volume_summary(src: &FileSource) -> Option<Value> {
-    let v = Volume::open(src).ok()?;
+fn volume_summary(src: &FileSource, first_block: Option<u32>) -> Option<Value> {
+    let v = Volume::open_numbered(src, first_block).ok()?;
     Some(json!({"volume_id": v.volume_id, "system_id": v.system_id, "layout": v.layout.describe()}))
 }
 
@@ -188,29 +255,43 @@ fn open_disc(ctx: &Ctx<'_>, path: Option<&str>, track: Option<u32>) -> Result<Di
         if track.is_some() {
             return Err(ToolError::invalid("track only applies to a .cue sheet"));
         }
-        let source = open_file(&p)?;
+        let source = open_file(&p, &ctx.cancel)?;
         if iso9660::detect(&source).is_none() {
             return Err(ToolError::unsupported(format!("{} doesn't hold an ISO 9660 disc volume", name_of(&p)))
                 .with_remediation("This reads ISO 9660 images: a cooked .iso, or a raw .bin track from a .cue sheet (pass the .cue). firmware_regions_list can look for other filesystems."));
         }
-        return Ok(Disc { name: name_of(&p), image: p, source, track: None, others: Vec::new(), sheet: None });
+        return Ok(Disc { name: name_of(&p), image: p, source, first_block: None, track: None, others: Vec::new(), sheet: None, later_data: Vec::new() });
     }
     let sheet = read_cue(&p)?;
     if sheet.tracks.is_empty() {
         return Err(ToolError::unsupported(format!("{} lists no tracks", name_of(&p))));
     }
     let mut report = Vec::new();
-    let mut found: Vec<(CueTrack, PathBuf, FileSource, Value)> = Vec::new();
-    for t in &sheet.tracks {
-        let located = beside(&p, &t.file).filter(|f| f.is_file());
-        let mut row = json!({"track": t.number, "file": t.file, "mode": t.mode, "data": t.data, "found": located.is_some()});
+    let mut found: Vec<(CueTrack, PathBuf, FileSource, Option<u32>, Value)> = Vec::new();
+    // The file being walked and the disc block it starts at (known while every file before it was
+    // found: their sizes add up); a track's first block is then its file's plus its INDEX 01.
+    let mut current: Option<(&str, Option<u64>)> = None;
+    let mut next_block: Option<u64> = Some(0);
+    for (i, t) in sheet.tracks.iter().enumerate() {
+        let located = beside(&p, &t.file).filter(|f| is_regular_file(f));
+        let file_len = located.as_ref().and_then(|f| std::fs::metadata(f).ok()).map(|m| m.len());
+        if current.is_none_or(|(f, _)| f != t.file) {
+            current = Some((t.file.as_str(), next_block));
+            next_block = next_block.zip(file_len).and_then(|(s, len)| s.checked_add(len / sector_bytes(t)));
+        }
+        let (start, end) = track_span(&sheet.tracks, i, file_len.unwrap_or(0));
+        let first_block = current.and_then(|(_, b)| b).and_then(|b| b.checked_add(start / sector_bytes(t))).and_then(|b| u32::try_from(b).ok());
+        let mut row = json!({"track": t.number, "file": t.file, "mode": t.mode, "data": t.data, "found": located.is_some(), "offset_in_file": start});
         if let Some(file) = located
             && t.data
-            && let Ok(src) = open_file(&file)
-            && let Some(info) = volume_summary(&src)
+            && let Ok(mut src) = open_file(&file, &ctx.cancel)
         {
-            row["volume"] = info.clone();
-            found.push((t.clone(), file, src, info));
+            src.start = start;
+            src.len = end.saturating_sub(start);
+            if let Some(info) = volume_summary(&src, first_block) {
+                row["volume"] = info.clone();
+                found.push((t.clone(), file, src, first_block, info));
+            }
         }
         report.push(row);
     }
@@ -229,9 +310,10 @@ fn open_disc(ctx: &Ctx<'_>, path: Option<&str>, track: Option<u32>) -> Result<Di
         // A Dreamcast disc keeps the game in the high-density area: prefer it, else the first.
         None => found.iter().position(|(t, ..)| t.area.as_deref() == Some("high-density")).unwrap_or(0),
     };
-    let others = found.iter().enumerate().filter(|(i, _)| *i != pick).map(|(_, (t, _, _, info))| json!({"track": t.number, "volume": info})).collect();
-    let (t, file, source, _) = found.swap_remove(pick);
-    Ok(Disc { name: name_of(&file), image: file, source, track: Some(t), others, sheet: Some(json!(report)) })
+    let others = found.iter().enumerate().filter(|(i, _)| *i != pick).map(|(_, (t, _, _, _, info))| json!({"track": t.number, "volume": info})).collect();
+    let (t, file, source, first_block, _) = found.swap_remove(pick);
+    let later_data = sheet.tracks.iter().filter(|x| x.data && x.number > t.number && x.file != t.file).cloned().collect();
+    Ok(Disc { name: name_of(&file), image: file, source, first_block, track: Some(t), others, sheet: Some(json!(report)), later_data })
 }
 
 fn norm_prefix(p: Option<&str>) -> Option<String> {
@@ -262,6 +344,7 @@ fn describe(disc: &Disc, vol: &Volume<'_, FileSource>) -> Value {
         "names": if vol.joliet { "Joliet (long names)" } else { "ISO 9660" },
         "declared_blocks": vol.declared_blocks,
         "file_size": disc.source.len,
+        "offset_in_file": disc.source.start,
     })
 }
 
@@ -282,16 +365,34 @@ fn limitations(list: &Listing, joliet: bool) -> Vec<Limitation> {
     l
 }
 
-fn list_all(vol: &Volume<'_, FileSource>) -> Listing {
-    vol.list(&Limits { max_entries: MAX_ENTRIES, ..Limits::default() })
+fn list_all(disc: &Disc, vol: &Volume<'_, FileSource>) -> Listing {
+    let mut list = vol.list(&Limits { max_entries: MAX_ENTRIES, ..Limits::default() });
+    let past_end = list.entries.iter().filter(|e| !e.is_dir && e.available < e.size).count();
+    if past_end > 0
+        && let Some(why) = disc.elsewhere()
+    {
+        list.warnings.insert(0, format!("{past_end} file(s) lie past the end of {}: {why}", disc.name));
+        list.complete = false;
+    }
+    list
+}
+
+/// What the listing says about one file, for the page of entries.
+fn entry_json(e: &DiscEntry) -> Value {
+    let mut v = json!({"path": e.path, "size": e.size, "block": e.lba, "present": e.available == e.size});
+    if let Some(why) = e.unreadable {
+        v["unreadable"] = json!(why);
+        v["why_not_read"] = json!(why.describe());
+    }
+    v
 }
 
 fn game_disc_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: DiscListParams = parse_params(params)?;
     let disc = open_disc(ctx, p.path.as_deref(), p.track)?;
     ctx.report(None, format!("Reading the directories of {}", disc.name));
-    let vol = Volume::open(&disc.source).map_err(|why| ToolError::unsupported(format!("{}: {why}", disc.name)))?;
-    let list = list_all(&vol);
+    let vol = disc.volume()?;
+    let list = list_all(&disc, &vol);
     ctx.cancel.check()?;
     let prefix = norm_prefix(p.prefix.as_deref());
     let files: Vec<&DiscEntry> = list.entries.iter().filter(|e| !e.is_dir && under(&e.path, &prefix)).collect();
@@ -299,8 +400,7 @@ fn game_disc_files_list(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, 
     let total_files = list.entries.iter().filter(|e| !e.is_dir).count();
     let bytes: u64 = list.entries.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
     let limit = p.limit.clamp(1, 20_000);
-    let page: Vec<Value> =
-        files.iter().skip(p.offset).take(limit).map(|e| json!({"path": e.path, "size": e.size, "block": e.lba, "present": e.available == e.size})).collect();
+    let page: Vec<Value> = files.iter().skip(p.offset).take(limit).map(|e| entry_json(e)).collect();
     let mut result = describe(&disc, &vol);
     result["files"] = json!(total_files);
     result["folders"] = json!(folders);
@@ -367,13 +467,15 @@ fn game_disc_files_extract(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutpu
     if !(1..=1_000_000).contains(&p.max_files) {
         return Err(ToolError::invalid("max_files must be 1..=1000000"));
     }
-    if p.max_bytes == 0 || p.max_bytes > 64 << 30 {
+    if p.max_bytes.is_some_and(|b| b == 0 || b > 64 << 30) {
         return Err(ToolError::invalid("max_bytes must be 1..=68719476736 (64 GiB)"));
     }
     let disc = open_disc(ctx, p.path.as_deref(), p.track)?;
-    let vol = Volume::open(&disc.source).map_err(|why| ToolError::unsupported(format!("{}: {why}", disc.name)))?;
+    let max_bytes = p.max_bytes.unwrap_or_else(|| default_max_bytes(disc.source.len));
+    let vol = disc.volume()?;
     ctx.report(None, format!("Reading the directories of {}", disc.name));
-    let list = list_all(&vol);
+    let list = list_all(&disc, &vol);
+    ctx.cancel.check()?;
     let prefix = norm_prefix(p.prefix.as_deref());
     let chosen: Vec<&DiscEntry> = list.entries.iter().filter(|e| under(&e.path, &prefix)).collect();
     let wanted_files = chosen.iter().filter(|e| !e.is_dir).count();
@@ -383,10 +485,13 @@ fn game_disc_files_extract(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutpu
     }
     let root = create_absent_dir(&p.output_directory)?;
     let guard = UnlessWritten::new(&root);
-    let (mut written, mut bytes) = (0usize, 0u64);
+    let (mut written, mut bytes, mut folders) = (0usize, 0u64, 0usize);
     let mut skipped: Vec<Value> = Vec::new();
     let mut skipped_count = 0usize;
     let mut manifest: Vec<Value> = Vec::new();
+    // Extents already written, with the first path written from each: overlapping directory
+    // records could otherwise write the same bytes under thousands of names.
+    let mut extents: HashMap<(u32, u64), &str> = HashMap::new();
     let mut note = |skipped: &mut Vec<Value>, path: &str, why: String| {
         skipped_count += 1;
         if skipped.len() < 200 {
@@ -402,19 +507,41 @@ fn game_disc_files_extract(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutpu
                 continue;
             }
         };
-        let dest = comps.iter().fold(root.clone(), |acc, c| acc.join(c));
+        let Some(dest) = join_under(&root, &comps) else {
+            note(&mut skipped, &e.path, "refused: the name would leave the output folder".into());
+            continue;
+        };
         if e.is_dir {
-            if let Err(err) = std::fs::create_dir_all(&dest) {
+            // Folders a file needs are made with it; this keeps empty ones, as many as max_files.
+            if folders >= p.max_files {
+                note(&mut skipped, &e.path, "folder limit reached (max_files)".into());
+            } else if let Err(err) = std::fs::create_dir_all(&dest) {
                 note(&mut skipped, &e.path, err.to_string());
+            } else {
+                folders += 1;
             }
             continue;
         }
-        if written >= p.max_files || bytes.saturating_add(e.size) > p.max_bytes {
-            note(&mut skipped, &e.path, "file count or byte limit reached".into());
+        if let Some(why) = e.unreadable {
+            note(&mut skipped, &e.path, why.describe().into());
             continue;
         }
         if e.available < e.size {
-            note(&mut skipped, &e.path, format!("runs past the end of the image ({} of {} bytes present)", e.available, e.size));
+            let why = match disc.elsewhere() {
+                Some(track) => format!("not in this track's file ({} of {} bytes present); {track}", e.available, e.size),
+                None => format!("runs past the end of the image ({} of {} bytes present)", e.available, e.size),
+            };
+            note(&mut skipped, &e.path, why);
+            continue;
+        }
+        if e.size > 0
+            && let Some(first) = extents.get(&(e.lba, e.size))
+        {
+            note(&mut skipped, &e.path, format!("same data as {first} (the directory points both at one extent); written once"));
+            continue;
+        }
+        if written >= p.max_files || bytes.saturating_add(e.size) > max_bytes {
+            note(&mut skipped, &e.path, format!("file count or byte limit reached (max_files {}, max_bytes {max_bytes})", p.max_files));
             continue;
         }
         if dest.exists() {
@@ -434,6 +561,9 @@ fn game_disc_files_extract(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutpu
             Ok(sha) => {
                 written += 1;
                 bytes += e.size;
+                if e.size > 0 {
+                    extents.insert((e.lba, e.size), e.path.as_str());
+                }
                 if manifest.len() < 1000 {
                     manifest.push(json!({"path": e.path, "size": e.size, "sha256": sha}));
                 }
@@ -453,6 +583,7 @@ fn game_disc_files_extract(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutpu
     );
     let mut result = describe(&disc, &vol);
     result["output_directory"] = json!(root.display().to_string());
+    result["max_bytes"] = json!(max_bytes);
     result["files_written"] = json!(written);
     result["bytes_written"] = json!(bytes);
     result["files_wanted"] = json!(wanted_files);
@@ -541,6 +672,9 @@ pub(crate) fn triage_cue(name: &str, path: &Path, bytes: &[u8]) -> (String, Valu
 /// A disc image or CUE sheet is not an archive the archive tools open: say so and point at the disc tools
 /// (reads about 38 KB of a big file, never all of it).
 pub(crate) fn not_an_archive(path: &Path) -> Option<ToolError> {
+    if !is_regular_file(path) {
+        return None;
+    }
     let mut head = Vec::new();
     let image =
         File::open(path).and_then(|f| f.take(iso9660::DETECT_PREFIX as u64).read_to_end(&mut head)).is_ok() && iso9660::detect(head.as_slice()).is_some();
@@ -669,5 +803,220 @@ mod tests {
         let ev = call(&e, "game_disc_files_extract", json!({"path": img, "output_directory": out})).expect("extracts");
         assert!(ev["result"]["skipped_count"].as_u64().unwrap_or(0) >= 1, "{:?}", ev["result"]);
         assert_eq!(std::fs::read(out.join("README.TXT")).expect("file"), b"hello disc");
+    }
+
+    /// Run on a thread with a time limit, so a walk or an extraction that runs away fails the test
+    /// instead of hanging it.
+    fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs)).expect("it finished in time")
+    }
+
+    fn skipped_reason(ev: &Value, path: &str) -> String {
+        ev["result"]["skipped"].as_array().and_then(|s| s.iter().find(|x| x["path"] == path)).and_then(|x| x["reason"].as_str()).unwrap_or_default().to_string()
+    }
+
+    fn files_under(dir: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("lists").flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                out.extend(files_under(&p));
+            } else {
+                out.push(p.display().to_string());
+            }
+        }
+        out
+    }
+
+    /// On Windows `root.join("C:x")` is "x in drive C's current folder", so `C:ESCAPE…` wrote into
+    /// the process's folder and `D:EVIL.BAT` onto drive D; device names open devices.
+    #[test]
+    fn names_that_would_leave_the_folder_are_refused_and_nothing_is_written_outside() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let img = dir.path().join("names.iso");
+        let nodes = vec![
+            Node::File("ok.txt", b"fine".to_vec()),
+            Node::File("C:ESCAPE_ISOFIX_7F3A", b"escaped".to_vec()),
+            Node::File("D:EVIL.BAT", b"@echo off".to_vec()),
+            Node::File("NUL", b"device".to_vec()),
+            Node::File("nul.txt", b"device".to_vec()),
+            Node::File("COM1", b"device".to_vec()),
+            Node::Dir("X:Y", vec![Node::File("z", b"zz".to_vec())]),
+        ];
+        std::fs::write(&img, iso_image(&nodes, Wrap::Cooked, "S", "V", false)).expect("write");
+        let e = engine();
+        let out = dir.path().join("out");
+        let ev = call(&e, "game_disc_files_extract", json!({"path": img, "output_directory": out})).expect("extracts");
+        assert_eq!(ev["result"]["files_written"], 1, "{:?}", ev["result"]);
+        for bad in ["C:ESCAPE_ISOFIX_7F3A", "D:EVIL.BAT", "NUL", "NUL.TXT", "COM1", "X:Y", "X:Y/Z"] {
+            assert!(skipped_reason(&ev, bad).starts_with("refused"), "{bad}: {:?}", ev["result"]["skipped"]);
+        }
+        assert_eq!(files_under(&out), vec![out.join("OK.TXT").display().to_string()]);
+        let here = std::env::current_dir().expect("cwd");
+        assert!(!here.join("ESCAPE_ISOFIX_7F3A").exists(), "a file was written outside the output folder");
+    }
+
+    /// Overlapping extents: thousands of records naming the same block (or neighbouring ones) once
+    /// wrote 8 GiB out of a 1 MiB image.
+    #[test]
+    fn overlapping_extents_are_written_once_and_output_is_bounded_by_the_image() {
+        use craft_anything_testkit::disc::{FIRST_BLOCK, SECTOR, cooked_volume, pack_records, record};
+        let names: Vec<String> = (0..20_000).map(|i| format!("F{i:05}")).collect();
+        let size = 256 << 10;
+        let root_blocks = (pack_records(&names.iter().map(|n| record(0, size, false, n.as_bytes())).collect::<Vec<_>>()).len() + 1) as u32;
+        let data = FIRST_BLOCK + root_blocks;
+        let mut recs = vec![record(FIRST_BLOCK, root_blocks * SECTOR as u32, true, &[0])];
+        for (i, n) in names.iter().enumerate() {
+            // Half name one extent; the others start one block apart, each overlapping the next.
+            let lba = if i.is_multiple_of(2) { data } else { data + (i as u32 / 2) % 128 };
+            recs.push(record(lba, size, false, n.as_bytes()));
+        }
+        let mut blocks = pack_records(&recs);
+        blocks.resize(root_blocks as usize + 256, [7u8; SECTOR]);
+        let image = cooked_volume(&blocks, root_blocks * SECTOR as u32);
+        let image_len = image.len() as u64;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let img = dir.path().join("overlap.iso");
+        std::fs::write(&img, image).expect("write");
+        let out = dir.path().join("out");
+        let ev = within(30, move || {
+            let e = engine();
+            call(&e, "game_disc_files_extract", json!({"path": img, "output_directory": out})).expect("extracts")
+        });
+        let written = ev["result"]["bytes_written"].as_u64().unwrap_or(u64::MAX);
+        assert!(written <= 2 * image_len, "{written} bytes written from a {image_len}-byte image");
+        assert!(skipped_reason(&ev, "F00002").contains("same data as F00000"), "{:?}", skipped_reason(&ev, "F00002"));
+        assert!(ev["result"]["skipped"].as_array().is_some_and(|s| s.iter().any(|x| x["reason"].as_str().is_some_and(|r| r.contains("byte limit")))));
+        assert_eq!(ev["coverage"]["status"], "partial");
+    }
+
+    /// Folders that overlap, list each other under ever longer paths and claim 64 MiB each: the
+    /// tools finish quickly, bounded, and say the listing is incomplete.
+    #[test]
+    fn hostile_directories_finish_in_time_and_stay_bounded() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let img = dir.path().join("hostile.iso");
+        std::fs::write(&img, craft_anything_testkit::disc::overlapping_dirs(512)).expect("write");
+        let out = dir.path().join("out");
+        let started = std::time::Instant::now();
+        let (list, extract) = within(60, move || {
+            let e = engine();
+            let list = call(&e, "game_disc_files_list", json!({"path": img})).expect("lists");
+            let extract = call(&e, "game_disc_files_extract", json!({"path": img, "output_directory": out, "max_files": 50}));
+            (list, extract)
+        });
+        assert!(started.elapsed() < std::time::Duration::from_secs(20), "took {:?}", started.elapsed());
+        assert_eq!(list["result"]["complete"], false);
+        let warnings = list["result"]["warnings"].to_string();
+        assert!(warnings.contains("add up to more than"), "{warnings}");
+        assert!(list["result"]["folders"].as_u64().is_some_and(|n| n > 1000));
+        // Folders only: nothing to write, but it ran to the end within the budgets.
+        assert!(extract.is_ok(), "{extract:?}");
+    }
+
+    #[test]
+    fn form_2_streams_are_not_extracted_as_data() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let img = dir.path().join("ps1.bin");
+        let nodes = vec![Node::File("system.cnf", b"BOOT = cdrom:\\SLUS_000.01;1".to_vec()), Node::XaFile("movie.str", vec![5u8; 4096], 0x1000)];
+        std::fs::write(&img, iso_image(&nodes, Wrap::RawMode2Form1, "PLAYSTATION", "PS1", false)).expect("write");
+        let e = engine();
+        let ev = call(&e, "game_disc_files_list", json!({"path": img})).expect("lists");
+        let movie = ev["result"]["entries"].as_array().and_then(|a| a.iter().find(|x| x["path"] == "MOVIE.STR").cloned()).unwrap_or_default();
+        assert_eq!(movie["unreadable"], "form-2", "{movie}");
+        let out = dir.path().join("out");
+        let ev = call(&e, "game_disc_files_extract", json!({"path": img, "output_directory": out})).expect("extracts");
+        assert_eq!(ev["result"]["files_written"], 1);
+        assert!(skipped_reason(&ev, "MOVIE.STR").contains("Mode 2 Form 2"), "{:?}", ev["result"]["skipped"]);
+        assert!(!out.join("MOVIE.STR").exists());
+    }
+
+    /// Two data tracks in one `.bin`: the second starts at its INDEX 01, and its blocks are
+    /// numbered from there.
+    #[test]
+    fn a_track_in_a_shared_bin_starts_at_its_index() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut bin = iso_image(&tree(), Wrap::RawMode1, "FIRST", "ONE", false);
+        assert!(bin.len() <= 40 * 2352);
+        bin.resize(40 * 2352, 0);
+        let second = vec![Node::File("second.txt", b"track two".to_vec())];
+        bin.extend(craft_anything_testkit::disc::iso_image_numbered(&second, Wrap::RawMode1, "SECOND", "TWO", 40));
+        std::fs::write(dir.path().join("disc.bin"), &bin).expect("write");
+        let sheet = dir.path().join("disc.cue");
+        std::fs::write(&sheet, "FILE \"disc.bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n  TRACK 02 MODE1/2352\n    INDEX 01 00:00:40\n")
+            .expect("write");
+        let e = engine();
+        let one = call(&e, "game_disc_files_list", json!({"path": sheet})).expect("lists");
+        assert_eq!(one["result"]["track"]["number"], 1);
+        assert_eq!(one["result"]["files"], 3);
+        let two = call(&e, "game_disc_files_list", json!({"path": sheet, "track": 2})).expect("lists track 2");
+        assert_eq!(two["result"]["system_id"], "SECOND");
+        assert_eq!(two["result"]["first_block"], 40);
+        assert_eq!(two["result"]["offset_in_file"], 40 * 2352);
+        assert_eq!(two["result"]["entries"][0]["path"], "SECOND.TXT");
+        let out = dir.path().join("out");
+        call(&e, "game_disc_files_extract", json!({"path": sheet, "track": 2, "output_directory": out})).expect("extracts");
+        assert_eq!(std::fs::read(out.join("SECOND.TXT")).expect("file"), b"track two");
+    }
+
+    /// A Dreamcast disc with CD audio: the file system spans track 3 and the last data track, and
+    /// only track 3's file is read, so files in the last track are missing; the listing says so.
+    #[test]
+    fn files_in_a_later_track_make_the_listing_incomplete_and_name_the_track() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let full = iso_image(&tree(), Wrap::GdRom, "SEGA SEGAKATANA", "DC", false);
+        std::fs::write(dir.path().join("g (Track 1).bin"), vec![0u8; 2352 * 4]).expect("write");
+        std::fs::write(dir.path().join("g (Track 2).bin"), vec![0u8; 2352 * 4]).expect("write");
+        std::fs::write(dir.path().join("g (Track 3).bin"), full.get(..full.len() - 2352).unwrap_or_default()).expect("write");
+        std::fs::write(dir.path().join("g (Track 4).bin"), vec![0u8; 2352 * 4]).expect("write");
+        std::fs::write(dir.path().join("g (Track 5).bin"), vec![0u8; 2352 * 4]).expect("write");
+        let cue = "REM SINGLE-DENSITY AREA\nFILE \"g (Track 1).bin\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\nFILE \"g (Track 2).bin\" BINARY\n  TRACK 02 AUDIO\n    INDEX 00 00:00:00\n    INDEX 01 00:02:00\nREM HIGH-DENSITY AREA\nFILE \"g (Track 3).bin\" BINARY\n  TRACK 03 MODE1/2352\n    INDEX 01 00:00:00\nFILE \"g (Track 4).bin\" BINARY\n  TRACK 04 AUDIO\n    INDEX 00 00:00:00\n    INDEX 01 00:02:00\nFILE \"g (Track 5).bin\" BINARY\n  TRACK 05 MODE1/2352\n    INDEX 00 00:00:00\n    INDEX 01 00:03:00\n";
+        let sheet = dir.path().join("g.cue");
+        std::fs::write(&sheet, cue).expect("write");
+        let e = engine();
+        let ev = call(&e, "game_disc_files_list", json!({"path": sheet})).expect("lists");
+        assert_eq!(ev["result"]["track"]["number"], 3);
+        assert_eq!(ev["result"]["complete"], false);
+        let first = ev["result"]["warnings"][0].as_str().unwrap_or_default().to_string();
+        assert!(first.contains("1 file(s) lie past the end") && first.contains("track 5 (g (Track 5).bin)"), "{first}");
+        let out = dir.path().join("out");
+        let ev = call(&e, "game_disc_files_extract", json!({"path": sheet, "output_directory": out})).expect("extracts");
+        assert!(skipped_reason(&ev, "PSP_GAME/SYSDIR/EBOOT.BIN").contains("track 5"), "{:?}", ev["result"]["skipped"]);
+        assert_eq!(std::fs::read(out.join("README.TXT")).expect("file"), b"hello disc");
+    }
+
+    #[test]
+    fn a_folder_or_missing_path_is_never_opened_as_a_sheet() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let folder = dir.path().join("x.cue");
+        std::fs::create_dir(&folder).expect("dir");
+        assert!(!super::is_cue(&folder));
+        assert!(super::read_cue(&folder).is_err());
+        assert!(super::not_an_archive(&folder).is_none());
+        assert!(super::not_an_archive(&dir.path().join("missing.iso")).is_none());
+    }
+
+    /// Opening a FIFO for reading waits for a writer; the disc tools check it is a file first.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_waiting() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let fifo = dir.path().join("pipe.cue");
+        let made = craft_anything_platform::process::Process::new("mkfifo").arg(&fifo).timeout(std::time::Duration::from_secs(10)).run();
+        if made.is_err() || !fifo.exists() {
+            return; // no mkfifo here
+        }
+        let p = fifo.clone();
+        let (cue, archive) = within(10, move || (super::is_cue(&p), super::not_an_archive(&p).is_none()));
+        assert!(!cue && archive);
+        let err = within(10, move || {
+            let e = engine();
+            call(&e, "game_disc_files_list", json!({"path": fifo}))
+        });
+        assert!(err.is_err());
     }
 }

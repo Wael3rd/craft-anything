@@ -497,6 +497,14 @@ branch; `git stash` keeps only tracked files, so a new file stayed in the tree a
 put it into the other PR. Use `git stash -u` (or commit the work in progress on its own branch),
 and read `git status` before `git add -A`.
 
+**A name that replaced the output folder.** Extraction refused `..`, absolute paths and a bare
+`C:`, but on Windows `root.join("C:.cargo")` is "`.cargo` in drive C's current folder", not under
+`root`, so a disc or archive member named `C:.cargo/config.toml` was written into the process's
+folder (a person's project) and `D:evil.bat` onto drive D; `NUL` or `com1.txt` name devices. Only
+a component that is one `Component::Normal` with no `:`, no control character, no trailing dot or
+space and no device name is safe: build paths from names read out of a file with
+`artifact_tools::join_under`, never `PathBuf::join` alone.
+
 **A cooked guess that matched a raw disc.** The firmware scan looked for an ISO 9660 volume as
 `CD001` at +0x8001; a raw 2352-byte track holds the same bytes 16 bytes into sector 16, so the cooked
 check "found" a volume 4,880 bytes into the file and the real one was never reported. When two

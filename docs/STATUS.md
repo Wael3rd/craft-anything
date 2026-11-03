@@ -91,8 +91,12 @@ track (Mode 1 or Mode 2 Form 1) or a `.cue` sheet, including a Dreamcast GD-ROM 
 They read through a file handle, so a multi-gigabyte image is never loaded; triage names the volume,
 system and file count. Checked live on a 517 MB PSP ISO (1529 files extracted in 2 s) and on a
 Dreamcast `.cue` with a 1.18 GB track (497 files; `1ST_READ.BIN` matches a known copy by SHA-256).
-Not read: Rock Ridge, multi-extent files, Mode 2 Form 2 sectors; Joliet is untested; other disc
-formats (`.chd`, `.cdi`, `.gdi`) aren't recognised.
+Hostile images stay bounded: one directory in memory at a time, 64 MiB of directory reads, 4096-byte
+paths and 32 MiB of paths in all, an extent written once and at most twice the image's size by
+default; names that would leave the output folder or that Windows reserves are refused. A track that
+shares its `.bin` starts at its `INDEX 01`. Not read: Rock Ridge, multi-extent files, Mode 2 Form 2
+and CD-audio files (flagged), files in a later track of a multi-track file system (named; a Dreamcast
+disc with CD audio); Joliet is untested; other disc formats (`.chd`, `.cdi`, `.gdi`) aren't recognised.
 
 ## Known limits
 

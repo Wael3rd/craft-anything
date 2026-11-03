@@ -9,11 +9,13 @@
 //! The reader works on a [`Source`] (a byte slice here, a file in the engine) so a multi-gigabyte
 //! image is never read whole: only the volume descriptors and the directories are read to list it,
 //! and a file's bytes are read when asked for. Joliet names (UCS-2) are used when the disc has them.
-//! Everything is bounded (entries, depth, directory bytes) and a corrupt or looping directory
-//! becomes a warning, never a panic or a hang.
+//! Everything is bounded (entries, depth, the bytes of one directory and of all of them, the length
+//! of a path and of all paths) and only one directory's bytes are held at a time; a corrupt or
+//! looping directory becomes a warning, never a panic or a hang, and a [`Source`] can stop a walk.
 //!
-//! Not read: Rock Ridge extensions, multi-extent files (joined), interleaved files and the 2324-byte
-//! Form 2 sectors some PlayStation video files use.
+//! Not read: Rock Ridge extensions, multi-extent files (joined), and files whose CD-XA attributes
+//! say they are Mode 2 Form 2 (2324-byte sectors: PlayStation video and streamed audio) or CD
+//! audio: they are listed with [`DiscEntry::unreadable`] set, never read as if they were data.
 
 use super::{FsEntry, FsImage, Limits, is_dot, join};
 use serde::Serialize;
@@ -27,6 +29,14 @@ const FIRST_DESCRIPTOR: u64 = 16;
 const MAX_DESCRIPTORS: u64 = 32;
 /// Largest directory read into memory.
 const MAX_DIR_BYTES: u64 = 64 << 20;
+/// Most directory bytes read in one walk (a real disc's directories take a few megabytes; without
+/// this, thousands of folders each claiming 64 MiB would be read one after another).
+pub const MAX_DIR_TOTAL: u64 = 64 << 20;
+/// Longest path listed, in bytes; a name that would make one longer is skipped with a warning.
+pub const MAX_PATH_BYTES: usize = 4096;
+/// Most bytes of paths kept for one walk (folders that overlap can list the same records under
+/// ever longer paths).
+pub const MAX_PATH_TOTAL: usize = 32 << 20;
 /// The first block of a Dreamcast GD-ROM high-density area.
 pub const GDROM_HIGH_DENSITY: u32 = 45_000;
 
@@ -38,6 +48,11 @@ pub trait Source {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> bool;
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+    /// True when whoever asked has given up: a walk stops at the next directory (or every few
+    /// thousand records) and says it was stopped.
+    fn cancelled(&self) -> bool {
+        false
     }
 }
 
@@ -122,6 +137,48 @@ pub struct DiscEntry {
     pub lba: u32,
     /// Bytes of the file actually present in the image (less than `size` when the image is cut short).
     pub available: u64,
+    /// Set when the file's sectors aren't 2048-byte data sectors, so its bytes can't be read here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<Unreadable>,
+}
+
+/// Why a listed file's bytes aren't read: its CD-XA attributes say its sectors aren't data sectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Unreadable {
+    /// Mode 2 Form 2 sectors (2324 bytes each, no error correction): PlayStation video and streamed audio.
+    #[serde(rename = "form-2")]
+    Form2,
+    /// CD audio sectors.
+    CdAudio,
+}
+
+impl Unreadable {
+    /// Plain-English reason.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Unreadable::Form2 => {
+                "stored in Mode 2 Form 2 sectors (2324 bytes each: video or streamed audio), which this reader doesn't take out; reading them as 2048-byte data would give wrong bytes"
+            }
+            Unreadable::CdAudio => "CD audio, not data sectors; it isn't read",
+        }
+    }
+}
+
+/// The CD-XA attributes in a directory record's system use field, when it has them.
+fn xa_kind(rec: &[u8], name_len: usize) -> Option<Unreadable> {
+    let after_name = 33usize.checked_add(name_len)?;
+    // The field follows a padding byte when the name's length is even; some mastering tools leave it out.
+    let padded = after_name.checked_add(usize::from(name_len.is_multiple_of(2)))?;
+    let xa = [padded, after_name].into_iter().filter_map(|s| rec.get(s..)).find(|su| su.get(6..8) == Some(b"XA"))?;
+    let attributes = u16::from_be_bytes([*xa.get(4)?, *xa.get(5)?]);
+    if attributes & 0x4000 != 0 {
+        Some(Unreadable::CdAudio)
+    } else if attributes & 0x1000 != 0 {
+        Some(Unreadable::Form2)
+    } else {
+        None
+    }
 }
 
 /// What a walk of the directory tree found.
@@ -138,6 +195,18 @@ impl Listing {
         if self.warnings.len() < 256 {
             self.warnings.push(msg.into());
         }
+    }
+
+    /// Why the walk stopped early: put first and kept even past the warning cap (it happens once a
+    /// walk), so a listing cut short always says why.
+    fn stopped(&mut self, msg: impl Into<String>) {
+        self.headline(msg);
+        self.complete = false;
+    }
+
+    /// A warning that goes first, ahead of the per-file ones, whatever the cap.
+    fn headline(&mut self, msg: impl Into<String>) {
+        self.warnings.insert(0, msg.into());
     }
 }
 
@@ -162,6 +231,13 @@ pub struct Volume<'a, S: Source + ?Sized> {
 impl<'a, S: Source + ?Sized> Volume<'a, S> {
     /// Open the volume at the start of `src`. The error says in plain English why it isn't one.
     pub fn open(src: &'a S) -> Result<Volume<'a, S>, String> {
+        Self::open_numbered(src, None)
+    }
+
+    /// As [`Volume::open`], trying `first_block` first as the number of the image's first block: a
+    /// track that starts part-way into a disc (a second track in a shared `.bin`) numbers its blocks
+    /// from where it starts on the disc. Block 0 and the GD-ROM high-density area are tried after it.
+    pub fn open_numbered(src: &'a S, first_block: Option<u32>) -> Result<Volume<'a, S>, String> {
         let layout = detect(src).ok_or_else(|| "no ISO 9660 volume descriptor at sector 16".to_string())?;
         let sector = u64::from(layout.sector_size);
         let total_sectors = src.len() / sector;
@@ -205,7 +281,7 @@ impl<'a, S: Source + ?Sized> Volume<'a, S> {
             total_sectors,
         };
         // The root directory's own `.` record points at itself; that tells which numbering the file uses.
-        let base = [0u32, GDROM_HIGH_DENSITY].into_iter().find(|b| {
+        let base = first_block.into_iter().chain([0u32, GDROM_HIGH_DENSITY]).find(|b| {
             vol.lba_base = *b;
             vol.points_at_itself(root_lba)
         });
@@ -266,43 +342,90 @@ impl<'a, S: Source + ?Sized> Volume<'a, S> {
         done
     }
 
-    /// Walk the directory tree within `limits`.
+    /// Walk the directory tree within `limits` (and the walk budgets: [`MAX_DIR_TOTAL`],
+    /// [`MAX_PATH_BYTES`], [`MAX_PATH_TOTAL`]). Folders are walked depth first in disc order, one
+    /// at a time: a folder's bytes are dropped before the next is read, and a folder waiting its
+    /// turn is only its entry's index and extent.
     pub fn list(&self, limits: &Limits) -> Listing {
         let mut out = Listing { complete: true, ..Listing::default() };
-        let mut visited = HashSet::new();
-        self.walk(self.root_lba, self.root_size, "", 0, limits, &mut out, &mut visited);
+        let mut walk = Walk { visited: HashSet::new(), dir_bytes: 0, path_bytes: 0, stop: false };
+        let mut pending = vec![Pending { entry: None, lba: self.root_lba, size: self.root_size, depth: 0 }];
+        while let Some(dir) = pending.pop() {
+            if self.src.cancelled() {
+                out.stopped("stopped before the end: cancelled");
+                break;
+            }
+            if out.entries.len() >= limits.max_entries {
+                out.complete = false;
+                break;
+            }
+            let subdirs = self.read_dir(&dir, limits, &mut out, &mut walk);
+            if walk.stop {
+                break;
+            }
+            pending.extend(subdirs.into_iter().rev());
+        }
+        let flagged = out.entries.iter().filter(|e| e.unreadable.is_some()).count();
+        if flagged > 0 {
+            out.headline(format!(
+                "{flagged} file(s) are Mode 2 Form 2 streams (video, streamed audio) or CD audio; they are listed but their bytes aren't read"
+            ));
+        }
         out
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn walk(&self, lba: u32, size: u32, parent: &str, depth: usize, limits: &Limits, out: &mut Listing, visited: &mut HashSet<u32>) {
+    /// List one folder's records into `out` and return its sub-folders, in disc order.
+    fn read_dir(&self, dir: &Pending, limits: &Limits, out: &mut Listing, walk: &mut Walk) -> Vec<Pending> {
+        let mut subdirs = Vec::new();
+        // The folder's own path, copied once (it lives in `out.entries`, which grows below).
+        let parent = dir.entry.and_then(|i| out.entries.get(i)).map(|e| e.path.clone()).unwrap_or_default();
+        let parent = parent.as_str();
+        let (lba, size, depth) = (dir.lba, dir.size, dir.depth);
         if depth > limits.max_depth.min(128) {
             out.warn("directory nesting limit reached");
             out.complete = false;
-            return;
+            return subdirs;
         }
-        if !visited.insert(lba) {
+        if !walk.visited.insert(lba) {
             out.warn(format!("{}: a directory leads back to one already read; not followed", shown(parent)));
             out.complete = false;
-            return;
+            return subdirs;
         }
         let want = u64::from(size).min(MAX_DIR_BYTES);
         if u64::from(size) > MAX_DIR_BYTES {
             out.warn(format!("{}: directory of {size} bytes cut to {MAX_DIR_BYTES}", shown(parent)));
             out.complete = false;
         }
-        let have = want.min(self.available(lba, want));
+        let mut have = want.min(self.available(lba, want));
         if have < want {
             out.warn(format!("{}: directory runs past the end of the image", shown(parent)));
             out.complete = false;
         }
-        let Ok(have_len) = usize::try_from(have) else { return };
+        let left = MAX_DIR_TOTAL.saturating_sub(walk.dir_bytes);
+        if have > left {
+            out.stopped(format!(
+                "{}: the directories add up to more than {} MiB, more than any real disc holds; the rest aren't read",
+                shown(parent),
+                MAX_DIR_TOTAL >> 20
+            ));
+            walk.stop = true;
+            have = left;
+        }
+        walk.dir_bytes = walk.dir_bytes.saturating_add(have);
+        let Ok(have_len) = usize::try_from(have) else { return subdirs };
         let mut dir = vec![0u8; have_len];
         let got = self.read_at(lba, 0, &mut dir);
         dir.truncate(got);
-        let mut subdirs: Vec<(String, u32, u32)> = Vec::new();
         let mut pos = 0usize;
+        let mut records = 0usize;
+        let mut too_long = 0usize;
         while pos < dir.len() {
+            records += 1;
+            if records.is_multiple_of(4096) && self.src.cancelled() {
+                out.stopped("stopped before the end: cancelled");
+                walk.stop = true;
+                break;
+            }
             let rec_len = usize::from(dir.get(pos).copied().unwrap_or(0));
             if rec_len == 0 {
                 // Records never cross a sector: padding to the next one.
@@ -335,14 +458,24 @@ impl<'a, S: Source + ?Sized> Volume<'a, S> {
                 continue;
             }
             if out.entries.len() >= limits.max_entries {
-                out.warn("entry limit reached");
-                out.complete = false;
+                out.stopped("entry limit reached");
                 break;
             }
+            let path_len = if parent.is_empty() { name.len() } else { parent.len().saturating_add(1).saturating_add(name.len()) };
+            if path_len > MAX_PATH_BYTES {
+                too_long += 1;
+                continue;
+            }
+            if walk.path_bytes.saturating_add(path_len) > MAX_PATH_TOTAL {
+                out.stopped(format!("the paths listed add up to more than {} MiB; the rest aren't listed", MAX_PATH_TOTAL >> 20));
+                walk.stop = true;
+                break;
+            }
+            walk.path_bytes = walk.path_bytes.saturating_add(path_len);
             let path = join(parent, &name);
             if is_dir {
-                out.entries.push(DiscEntry { path: path.clone(), is_dir: true, size: 0, lba: e_lba, available: 0 });
-                subdirs.push((path, e_lba, e_size));
+                subdirs.push(Pending { entry: Some(out.entries.len()), lba: e_lba, size: e_size, depth: depth.saturating_add(1) });
+                out.entries.push(DiscEntry { path, is_dir: true, size: 0, lba: e_lba, available: 0, unreadable: None });
             } else {
                 if flags & 0x80 != 0 {
                     out.warn(format!("{path}: continues in another extent; only the first part is listed"));
@@ -351,18 +484,37 @@ impl<'a, S: Source + ?Sized> Volume<'a, S> {
                 let avail = self.available(e_lba, u64::from(e_size));
                 if avail < u64::from(e_size) {
                     out.warn(format!("{path}: runs past the end of the image ({avail} of {e_size} bytes present)"));
+                    out.complete = false;
                 }
-                out.entries.push(DiscEntry { path, is_dir: false, size: u64::from(e_size), lba: e_lba, available: avail });
+                let unreadable = xa_kind(rec, name_len);
+                out.entries.push(DiscEntry { path, is_dir: false, size: u64::from(e_size), lba: e_lba, available: avail, unreadable });
             }
         }
-        for (path, l, s) in subdirs {
-            if out.entries.len() >= limits.max_entries {
-                out.complete = false;
-                break;
-            }
-            self.walk(l, s, &path, depth + 1, limits, out, visited);
+        if too_long > 0 {
+            out.warn(format!("{}: {too_long} name(s) would make paths longer than {MAX_PATH_BYTES} bytes; skipped", shown(parent)));
+            out.complete = false;
         }
+        subdirs
     }
+}
+
+/// Running totals of one walk.
+struct Walk {
+    visited: HashSet<u32>,
+    /// Directory bytes read so far.
+    dir_bytes: u64,
+    /// Bytes of the paths listed so far.
+    path_bytes: usize,
+    /// A budget ran out or the walk was cancelled: nothing more is read.
+    stop: bool,
+}
+
+/// A folder waiting to be read: its entry in the listing (None for the root), extent and depth.
+struct Pending {
+    entry: Option<usize>,
+    lba: u32,
+    size: u32,
+    depth: usize,
 }
 
 fn shown(path: &str) -> &str {
@@ -370,6 +522,8 @@ fn shown(path: &str) -> &str {
 }
 
 /// A name as one path component: version suffix and trailing dot dropped, separators replaced.
+/// Otherwise names stay as the disc spells them (a `:` or a Windows device name included): the
+/// listing reports what is there, and the tools that write files refuse names that aren't safe.
 fn clean_name(raw: &str, is_dir: bool, max: usize) -> String {
     let mut s = raw.to_string();
     if !is_dir
@@ -406,18 +560,23 @@ pub fn read(data: &[u8], limits: &Limits) -> FsImage {
             img.entries.push(FsEntry::dir(e.path));
             continue;
         }
-        let fits = e.size <= limits.max_file_bytes && img.bytes.saturating_add(e.size) <= limits.max_total_bytes && e.available == e.size;
+        let fits =
+            e.size <= limits.max_file_bytes && img.bytes.saturating_add(e.size) <= limits.max_total_bytes && e.available == e.size && e.unreadable.is_none();
         let bytes = usize::try_from(e.size).ok().filter(|_| fits).and_then(|n| {
             let mut buf = vec![0u8; n];
             (vol.read_at(e.lba, 0, &mut buf) == n).then_some(buf)
         });
-        match &bytes {
-            Some(b) => img.bytes = img.bytes.saturating_add(b.len() as u64),
-            None if e.size > 0 => {
+        match (&bytes, e.unreadable) {
+            (Some(b), _) => img.bytes = img.bytes.saturating_add(b.len() as u64),
+            (None, Some(why)) => {
+                img.warn(format!("{}: {}", e.path, why.describe()));
+                img.complete = false;
+            }
+            (None, None) if e.size > 0 => {
                 img.warn(format!("{}: file data not recovered (size or bounds)", e.path));
                 img.complete = false;
             }
-            None => {}
+            (None, None) => {}
         }
         img.entries.push(FsEntry::file(e.path, e.size, bytes));
     }
@@ -514,6 +673,127 @@ mod tests {
         assert_eq!(clean_name("DIR.X", true, 255), "DIR.X");
         assert_eq!(clean_name("a/b\\c", false, 255), "a_b_c");
         assert_eq!(clean_name("", false, 255), "_");
+    }
+
+    #[test]
+    fn form_2_and_audio_files_are_listed_but_not_read() {
+        let nodes = vec![
+            Node::File("plain.bin", vec![1u8; 3000]),
+            Node::XaFile("movie.str", vec![2u8; 4096], 0x1000 | 0x2000),
+            Node::XaFile("track.da", vec![3u8; 2048], 0x4000),
+            Node::XaFile("form1.dat", vec![4u8; 2100], 0x0800),
+        ];
+        for wrap in [Wrap::Cooked, Wrap::RawMode2Form1] {
+            let img = image(&nodes, wrap, "PLAYSTATION", "XA", false);
+            let list = Volume::open(img.as_slice()).expect("opens").list(&Limits::default());
+            let kind = |p: &str| list.entries.iter().find(|e| e.path == p).map(|e| e.unreadable);
+            assert_eq!(kind("PLAIN.BIN"), Some(None));
+            assert_eq!(kind("FORM1.DAT"), Some(None));
+            assert_eq!(kind("MOVIE.STR"), Some(Some(Unreadable::Form2)));
+            assert_eq!(kind("TRACK.DA"), Some(Some(Unreadable::CdAudio)));
+            assert!(list.warnings.iter().any(|w| w.contains("2 file(s) are Mode 2 Form 2")), "{:?}", list.warnings);
+            let fs = read(&img, &Limits::default());
+            let data = |p: &str| fs.entries.iter().find(|e| e.path == p).and_then(|e| e.data.clone());
+            assert_eq!(data("FORM1.DAT"), Some(vec![4u8; 2100]));
+            assert_eq!(data("MOVIE.STR"), None, "wrong bytes must not pass for the file");
+            assert_eq!(data("TRACK.DA"), None);
+            assert!(!fs.complete);
+        }
+    }
+
+    /// Folders that overlap list the same records again and again, each time under a longer path
+    /// (once ~8.5 GB of paths from a 1 MiB image). Paths are capped one by one and in total.
+    #[test]
+    fn overlapping_folders_with_long_names_stay_within_the_path_budgets() {
+        // 40 sectors: the chain of folders gets 20 deep before the paths add up (the cap on one
+        // path is what stops it); 512 sectors (1 MiB): the paths add up first.
+        for (blocks, expect) in [(40, "longer than 4096"), (512, "paths listed add up to more than 32 MiB")] {
+            let img = craft_anything_testkit::disc::overlapping_dirs(blocks);
+            assert!(img.len() < 1_200_000);
+            let started = std::time::Instant::now();
+            let list = Volume::open(img.as_slice()).expect("opens").list(&Limits::default());
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
+            assert!(!list.complete);
+            let total: usize = list.entries.iter().map(|e| e.path.len()).sum();
+            assert!(total <= MAX_PATH_TOTAL, "{total} bytes of paths");
+            assert!(list.entries.iter().all(|e| e.path.len() <= MAX_PATH_BYTES));
+            assert!(list.warnings.iter().any(|w| w.contains(expect)), "{blocks}: {:?}", list.warnings.last());
+        }
+    }
+
+    /// Counts what a walk reads, and gives up after `cancel_after` reads.
+    struct Counting<'a> {
+        data: &'a [u8],
+        read: std::cell::Cell<u64>,
+        reads: std::cell::Cell<u64>,
+        cancel_after: u64,
+    }
+
+    impl Source for Counting<'_> {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> bool {
+            self.read.set(self.read.get() + buf.len() as u64);
+            self.reads.set(self.reads.get() + 1);
+            self.data.read_at(offset, buf)
+        }
+        fn cancelled(&self) -> bool {
+            self.reads.get() >= self.cancel_after
+        }
+    }
+
+    /// A thousand folders, each claiming 4 GiB and spanning the rest of the image.
+    fn many_big_folders(count: u32) -> Vec<u8> {
+        use craft_anything_testkit::disc::{FIRST_BLOCK, SECTOR, cooked_volume, pack_records, record};
+        let names: Vec<String> = (0..count).map(|i| format!("D{i:04}")).collect();
+        let root_blocks = u32::try_from(pack_records(&names.iter().map(|n| record(0, 0, true, n.as_bytes())).collect::<Vec<_>>()).len() + 1).unwrap_or(0);
+        let mut recs = vec![record(FIRST_BLOCK, root_blocks * SECTOR as u32, true, &[0])];
+        recs.extend(names.iter().enumerate().map(|(i, n)| record(FIRST_BLOCK + root_blocks + i as u32, u32::MAX, true, n.as_bytes())));
+        let mut blocks = pack_records(&recs);
+        blocks.resize(root_blocks as usize + count as usize, [0u8; SECTOR]);
+        cooked_volume(&blocks, root_blocks * SECTOR as u32)
+    }
+
+    #[test]
+    fn directory_bytes_read_have_a_total_budget() {
+        let img = many_big_folders(1000);
+        let src = Counting { data: &img, read: 0.into(), reads: 0.into(), cancel_after: u64::MAX };
+        let started = std::time::Instant::now();
+        let list = Volume::open(&src).expect("opens").list(&Limits::default());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert!(!list.complete);
+        assert!(list.warnings.iter().any(|w| w.contains("directories add up to more than 64 MiB")), "{:?}", list.warnings.last());
+        // Without the budget this reads about 1 GB (each folder rereads the rest of the image).
+        assert!(src.read.get() <= MAX_DIR_TOTAL + (1 << 20), "{} bytes read", src.read.get());
+    }
+
+    #[test]
+    fn a_walk_stops_when_its_source_is_cancelled() {
+        let img = many_big_folders(1000);
+        let probe = Counting { data: &img, read: 0.into(), reads: 0.into(), cancel_after: u64::MAX };
+        let opening = {
+            let _ = Volume::open(&probe).expect("opens");
+            probe.reads.get()
+        };
+        // Given up before the walk, then part-way: it stops at the next folder, not at the end.
+        for (after, listed) in [(opening, false), (opening + 5, true)] {
+            let src = Counting { data: &img, read: 0.into(), reads: 0.into(), cancel_after: after };
+            let list = Volume::open(&src).expect("opens").list(&Limits::default());
+            assert!(!list.complete);
+            assert_eq!(!list.entries.is_empty(), listed);
+            assert!(list.warnings.iter().any(|w| w.contains("cancelled")), "{:?}", list.warnings);
+            assert!(src.read.get() < 16 << 20, "{} bytes read after cancelling", src.read.get());
+        }
+    }
+
+    #[test]
+    fn a_track_numbered_from_where_it_starts_opens() {
+        let img = craft_anything_testkit::disc::iso_image_numbered(&tree(), Wrap::RawMode1, "PSP GAME", "TESTDISC", 4000);
+        assert!(Volume::open(img.as_slice()).is_err(), "its blocks point 4000 blocks ahead");
+        let vol = Volume::open_numbered(img.as_slice(), Some(4000)).expect("opens");
+        assert_eq!(vol.lba_base, 4000);
+        assert_eq!(vol.list(&Limits::default()).entries.len(), 5);
     }
 
     #[test]
