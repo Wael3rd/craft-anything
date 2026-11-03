@@ -519,7 +519,9 @@ Owner: open · Status: in progress
       same rule as `artifact_tools::unsafe_component`
 - [ ] Disc images: `core_target_open` still reads a whole image into memory (2 GiB cap), so triage of a
       larger `.bin` is refused; open it by path with the disc tools instead (they stream)
-- [ ] Disc images: the Joliet (UCS-2) name path has no test (no synthetic or real Joliet disc was tried)
+- [x] Disc images: the Joliet (UCS-2) name path is tested on a synthetic image with both trees (long
+      and accented names read in full, the primary tree's short names not listed); no real Joliet
+      disc tried yet
 - [ ] Disc images: `.chd`, `.cdi`, `.gdi`, `.nrg`, `.mdf` and compressed discs aren't recognised
 - [ ] The managed Java doesn't start from a deep folder (its `jvm.dll` path past ~250 characters):
       Ghidra's launcher then blames `JAVA_HOME`, and our error points at an analysis log that was

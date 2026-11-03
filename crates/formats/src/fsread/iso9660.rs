@@ -618,6 +618,61 @@ mod tests {
         assert_eq!(f("PSP_GAME/SYSDIR/EBOOT.BIN").data.as_deref(), Some(boot.as_slice()));
     }
 
+    /// A cooked image with both trees: the primary one names a file `LONGFI~1.TXT`, the Joliet one
+    /// (UCS-2, escape `%/E`) gives the names in full, one with an accent.
+    fn joliet_image() -> Vec<u8> {
+        use craft_anything_testkit::disc::{pack_records, record};
+        let ucs2 = |s: &str| s.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<u8>>();
+        let descriptor = |kind: u8, root: u32| {
+            let mut d = [0u8; SECTOR];
+            d[0] = kind;
+            d[1..6].copy_from_slice(b"CD001");
+            d[6] = 1;
+            d[8..40].fill(b' ');
+            d[8..16].copy_from_slice(b"PSP GAME");
+            d[40..72].fill(b' ');
+            d[40..47].copy_from_slice(b"JOLIET1");
+            d[80..84].copy_from_slice(&24u32.to_le_bytes());
+            d[128..130].copy_from_slice(&2048u16.to_le_bytes());
+            if kind == 2 {
+                d[88..91].copy_from_slice(b"%/E");
+            }
+            d[156..190].copy_from_slice(&record(root, SECTOR as u32, true, &[0])[..34]);
+            d
+        };
+        let mut terminator = [0u8; SECTOR];
+        terminator[0] = 255;
+        terminator[1..6].copy_from_slice(b"CD001");
+        let dir = |root: u32, files: Vec<Vec<u8>>| {
+            let mut records = vec![record(root, SECTOR as u32, true, &[0]), record(root, SECTOR as u32, true, &[1])];
+            records.extend(files);
+            pack_records(&records).remove(0)
+        };
+        let primary = dir(20, vec![record(22, 5, false, b"LONGFI~1.TXT;1")]);
+        let joliet = dir(21, vec![record(22, 5, false, &ucs2("Long File Name.txt;1")), record(23, 5, false, &ucs2("Café.txt;1"))]);
+        let data = |s: &[u8]| {
+            let mut b = [0u8; SECTOR];
+            b[..s.len()].copy_from_slice(s);
+            b
+        };
+        let mut sectors = vec![[0u8; SECTOR]; 16];
+        sectors.extend([descriptor(1, 20), descriptor(2, 21), terminator, [0u8; SECTOR], primary, joliet, data(b"hello"), data(b"world")]);
+        sectors.concat()
+    }
+
+    #[test]
+    fn joliet_names_are_read_in_full_from_the_joliet_tree() {
+        let img = joliet_image();
+        let vol = Volume::open(img.as_slice()).expect("opens");
+        assert!(vol.joliet);
+        let fs = read(&img, &Limits::default());
+        assert!(fs.complete, "{:?}", fs.warnings);
+        let f = |p: &str| fs.entries.iter().find(|e| e.path == p).unwrap_or_else(|| panic!("{p} missing: {:?}", fs.entries));
+        assert_eq!(f("Long File Name.txt").data.as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(f("Café.txt").data.as_deref(), Some(b"world".as_slice()));
+        assert!(fs.entries.iter().all(|e| e.path != "LONGFI~1.TXT"), "the primary tree's short names aren't listed too");
+    }
+
     #[test]
     fn reads_a_cooked_image() {
         check(&image(&tree(), Wrap::Cooked, "PSP GAME", "TESTDISC", false), 0, 2048, 0);
